@@ -24,8 +24,9 @@ QString formatAge(qint64 created) {
 
 }
 
-TimelineModel::TimelineModel(QObject* parent)
-    : QAbstractListModel(parent) {}
+TimelineModel::TimelineModel(QObject* parent, bool newestFirst)
+    : QAbstractListModel(parent)
+    , m_newestFirst(newestFirst) {}
 
 int TimelineModel::rowCount(const QModelIndex& parent) const {
     if (parent.isValid())
@@ -45,6 +46,8 @@ QVariant TimelineModel::data(const QModelIndex& index, int role) const {
     case TimeRole: return formatAge(note.createdAt);
     case NpubRole: return note.npub;
     case FollowedRole: return m_follows.contains(note.pubkey);
+    case PictureRole: return note.picture.isEmpty() || !m_imageLookup ? QString() : m_imageLookup(note.picture);
+    case RichContentRole: return note.rich.isEmpty() ? note.content : note.rich;
     default: return {};
     }
 }
@@ -58,10 +61,12 @@ QHash<int, QByteArray> TimelineModel::roleNames() const {
         {TimeRole, "timeText"},
         {NpubRole, "npub"},
         {FollowedRole, "followed"},
+        {PictureRole, "picture"},
+        {RichContentRole, "richContent"},
     };
 }
 
-void TimelineModel::upsert(const NostrEvent& event, const QString& name) {
+void TimelineModel::upsert(const NostrEvent& event, const QString& name, const QString& picture) {
     if (indexOf(event.id) >= 0)
         return;
     Note note;
@@ -69,6 +74,10 @@ void TimelineModel::upsert(const NostrEvent& event, const QString& name) {
     note.pubkey = event.pubkey;
     note.content = event.content;
     note.name = name;
+    note.picture = picture;
+    note.tags = event.tags;
+    if (m_formatter)
+        note.rich = m_formatter(note.content, note.tags);
     note.npub = Keys::npubFromHex(event.pubkey);
     note.createdAt = event.createdAt;
 
@@ -85,14 +94,43 @@ void TimelineModel::upsert(const NostrEvent& event, const QString& name) {
     }
 }
 
-void TimelineModel::setName(const QString& pubkey, const QString& name) {
+void TimelineModel::setAuthor(const QString& pubkey, const QString& name, const QString& picture) {
     for (int i = 0; i < m_notes.size(); ++i) {
-        if (m_notes.at(i).pubkey != pubkey || m_notes.at(i).name == name)
+        if (m_notes.at(i).pubkey != pubkey)
+            continue;
+        if (m_notes.at(i).name == name && m_notes.at(i).picture == picture)
             continue;
         m_notes[i].name = name;
+        m_notes[i].picture = picture;
         const QModelIndex idx = index(i);
-        emit dataChanged(idx, idx, {NameRole});
+        emit dataChanged(idx, idx, {NameRole, PictureRole, RichContentRole});
     }
+}
+
+void TimelineModel::setFormatter(const std::function<QString(const QString&, const QVector<QStringList>&)>& formatter) {
+    m_formatter = formatter;
+    refreshMentions();
+}
+
+void TimelineModel::setImageLookup(const std::function<QString(const QString&)>& lookup) {
+    m_imageLookup = lookup;
+}
+
+void TimelineModel::refreshPicture(const QString& remoteUrl) {
+    for (int i = 0; i < m_notes.size(); ++i) {
+        if (m_notes.at(i).picture != remoteUrl)
+            continue;
+        const QModelIndex idx = index(i);
+        emit dataChanged(idx, idx, {PictureRole});
+    }
+}
+
+void TimelineModel::refreshMentions() {
+    if (m_notes.isEmpty() || !m_formatter)
+        return;
+    for (Note& note : m_notes)
+        note.rich = m_formatter(note.content, note.tags);
+    emit dataChanged(index(0), index(m_notes.size() - 1), {RichContentRole});
 }
 
 void TimelineModel::setFollows(const QSet<QString>& follows) {
@@ -124,8 +162,8 @@ int TimelineModel::indexOf(const QString& eventId) const {
     return -1;
 }
 
-bool TimelineModel::comesBefore(const Note& a, const Note& b) {
+bool TimelineModel::comesBefore(const Note& a, const Note& b) const {
     if (a.createdAt != b.createdAt)
-        return a.createdAt > b.createdAt;
-    return a.eventId < b.eventId;
+        return m_newestFirst ? a.createdAt > b.createdAt : a.createdAt < b.createdAt;
+    return m_newestFirst ? a.eventId < b.eventId : a.eventId > b.eventId;
 }

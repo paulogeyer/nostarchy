@@ -105,6 +105,10 @@ private:
         const QString type = arr.at(0).toString();
         if (type == QStringLiteral("EVENT") && arr.size() >= 3) {
             emit m_pool->eventReceived(m_url, arr.at(1).toString(), arr.at(2).toObject());
+        } else if (type == QStringLiteral("AUTH") && arr.size() >= 2) {
+            const QByteArray event = m_pool->authEvent(m_url, arr.at(1).toString());
+            if (!event.isEmpty())
+                send("[\"AUTH\"," + event + "]");
         } else if (type == QStringLiteral("OK") && arr.size() >= 4) {
             emit m_pool->okReceived(m_url, arr.at(1).toString(), arr.at(2).toBool(), arr.at(3).toString());
         } else if (type == QStringLiteral("EOSE") && arr.size() >= 2) {
@@ -145,7 +149,7 @@ void RelayPool::setRelays(const QStringList& urls) {
             next.append(url);
     }
     for (auto it = m_sessions.begin(); it != m_sessions.end();) {
-        if (!next.contains(it.key())) {
+        if (!next.contains(it.key()) && !m_metadata.contains(it.key()) && !m_outbox.contains(it.key())) {
             it.value()->stop();
             it.value()->deleteLater();
             it = m_sessions.erase(it);
@@ -163,6 +167,43 @@ void RelayPool::setRelays(const QStringList& urls) {
 
 QStringList RelayPool::relays() const { return m_order; }
 
+void RelayPool::addMetadataRelay(const QString& raw) {
+    const QString url = normalizeRelay(raw);
+    if (url.isEmpty() || (!m_metadata.contains(url) && m_metadata.size() >= 16))
+        return;
+    m_metadata.insert(url);
+    if (!m_sessions.contains(url))
+        m_sessions.insert(url, new Session(url, this));
+    else if (Session* session = m_sessions.value(url); session->open())
+        sendSubscriptions(session);
+}
+
+bool RelayPool::isMetadataSub(const QString& id) {
+    return id == QStringLiteral("profiles") || id == QStringLiteral("person") || id == QStringLiteral("thread")
+        || id == QStringLiteral("relaylists");
+}
+
+void RelayPool::addOutboxRelay(const QString& raw) {
+    const QString url = normalizeRelay(raw);
+    if (url.isEmpty() || m_order.contains(url))
+        return;
+    if (!m_outbox.contains(url) && m_outbox.size() >= 8)
+        return;
+    m_outbox.insert(url);
+    if (!m_sessions.contains(url))
+        m_sessions.insert(url, new Session(url, this));
+    else if (Session* session = m_sessions.value(url); session->open())
+        sendSubscriptions(session);
+}
+
+void RelayPool::setAuthSigner(const std::function<QByteArray(const QString&, const QString&)>& signer) {
+    m_signer = signer;
+}
+
+QByteArray RelayPool::authEvent(const QString& relay, const QString& challenge) const {
+    return m_signer ? m_signer(relay, challenge) : QByteArray();
+}
+
 void RelayPool::subscribe(const QString& id, const QJsonArray& filters) {
     QJsonArray message;
     message.append(QStringLiteral("REQ"));
@@ -171,6 +212,21 @@ void RelayPool::subscribe(const QString& id, const QJsonArray& filters) {
         message.append(filter);
     const QByteArray bytes = QJsonDocument(message).toJson(QJsonDocument::Compact);
     m_subs.insert(id, bytes);
+    for (Session* session : m_sessions) {
+        const QString url = session->url();
+        if (m_metadata.contains(url) && !isMetadataSub(id))
+            continue;
+        if (m_outbox.contains(url) && id != QStringLiteral("following"))
+            continue;
+        session->send(bytes);
+    }
+}
+
+void RelayPool::unsubscribe(const QString& id) {
+    if (!m_subs.contains(id))
+        return;
+    m_subs.remove(id);
+    const QByteArray bytes = QJsonDocument(QJsonArray{QStringLiteral("CLOSE"), id}).toJson(QJsonDocument::Compact);
     for (Session* session : m_sessions)
         session->send(bytes);
 }
@@ -189,14 +245,24 @@ int RelayPool::publish(const QByteArray& wireEvent) {
 
 int RelayPool::openCount() const {
     int n = 0;
-    for (const Session* session : m_sessions) {
-        if (session->open())
+    for (auto it = m_sessions.cbegin(); it != m_sessions.cend(); ++it) {
+        if (m_metadata.contains(it.key()) || m_outbox.contains(it.key()))
+            continue;
+        if (it.value()->open())
             ++n;
     }
     return n;
 }
 
 void RelayPool::sendSubscriptions(Session* session) {
-    for (auto it = m_subs.cbegin(); it != m_subs.cend(); ++it)
+    const QString url = session->url();
+    const bool metadata = m_metadata.contains(url);
+    const bool outbox = m_outbox.contains(url);
+    for (auto it = m_subs.cbegin(); it != m_subs.cend(); ++it) {
+        if (metadata && !isMetadataSub(it.key()))
+            continue;
+        if (outbox && it.key() != QStringLiteral("following"))
+            continue;
         session->send(it.value());
+    }
 }

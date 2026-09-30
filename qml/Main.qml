@@ -79,6 +79,50 @@ ApplicationWindow {
         }
     }
 
+    component Avatar: Rectangle {
+        property string picture: ""
+        property string label: ""
+        property int box: 28
+        implicitWidth: box
+        implicitHeight: box
+        width: box
+        height: box
+        radius: 6
+        color: "#2e2923"
+        clip: true
+        Image {
+            id: avatarImage
+            anchors.fill: parent
+            source: picture
+            fillMode: Image.PreserveAspectCrop
+            asynchronous: true
+            cache: true
+            sourceSize.width: box * 2
+            sourceSize.height: box * 2
+            visible: status === Image.Ready
+        }
+        Text {
+            anchors.centerIn: parent
+            visible: avatarImage.status !== Image.Ready
+            text: label.length ? label.charAt(0).toUpperCase() : "?"
+            color: "#e4a15a"
+            font.pixelSize: box > 40 ? 20 : 13
+            font.weight: Font.DemiBold
+        }
+    }
+
+    component RichNote: Text {
+        property string body
+        width: parent.width
+        text: body
+        textFormat: Text.RichText
+        color: "#f3ead7"
+        font.pixelSize: 14
+        wrapMode: Text.Wrap
+        linkColor: "#e4a15a"
+        onLinkActivated: (link) => app.openLink(link)
+    }
+
     Item {
         anchors.fill: parent
         visible: !app.hasIdentity
@@ -172,6 +216,19 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     onClicked: app.feedMode = 1
                 }
+                Field {
+                    id: followField
+                    Layout.fillWidth: true
+                    placeholderText: "npub1…"
+                    font.pixelSize: 11
+                    font.family: "DejaVu Sans Mono"
+                    onAccepted: app.followNpub(text)
+                }
+                QuietButton {
+                    text: "Follow npub"
+                    Layout.fillWidth: true
+                    onClicked: app.followNpub(followField.text)
+                }
 
                 Item { Layout.preferredHeight: 6 }
                 Text {
@@ -240,13 +297,26 @@ ApplicationWindow {
 
                 Rectangle { Layout.fillWidth: true; height: 1; color: "#2e2923" }
 
-                Text {
-                    text: app.displayName.length ? app.displayName : "unnamed"
-                    color: "#f6f1e7"
-                    font.pixelSize: 14
-                    font.weight: Font.DemiBold
-                    elide: Text.ElideRight
+                RowLayout {
                     Layout.fillWidth: true
+                    Avatar {
+                        picture: app.selfPicture
+                        label: app.displayName
+                        box: 32
+                    }
+                    Text {
+                        text: app.displayName.length ? app.displayName : "unnamed"
+                        color: "#e4a15a"
+                        font.pixelSize: 14
+                        font.weight: Font.DemiBold
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: app.openProfile(app.pubkey)
+                        }
+                    }
                 }
                 Text {
                     text: app.npub
@@ -362,8 +432,239 @@ ApplicationWindow {
                 border.color: "#2e2923"
                 clip: true
 
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    visible: app.viewingProfile
+                    spacing: 8
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QuietButton { text: "Back"; onClicked: app.closeProfile() }
+                        Avatar { picture: app.profilePicture; label: app.profileName; box: 48 }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            Text {
+                                text: app.profileName
+                                color: "#f6f1e7"
+                                font.pixelSize: 16
+                                font.weight: Font.DemiBold
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                text: app.profileNpub
+                                color: "#6f675e"
+                                font.pixelSize: 11
+                                font.family: "DejaVu Sans Mono"
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+                        }
+                    }
+                    RichNote {
+                        body: app.profileAbout
+                        visible: app.profileAbout.length > 0
+                        Layout.fillWidth: true
+                    }
+                    QuietButton {
+                        visible: app.profilePubkey !== app.pubkey
+                        text: app.followCount >= 0 && app.isFollowed(app.profilePubkey) ? "Following" : "Follow"
+                        onClicked: app.toggleFollow(app.profilePubkey)
+                    }
+                    Text {
+                        text: "NOTES"
+                        color: "#6f675e"
+                        font.pixelSize: 11
+                        font.letterSpacing: 1.4
+                    }
+                    ListView {
+                        id: profileView
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 8
+                        clip: true
+                        model: app.profileNotes
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                        delegate: Rectangle {
+                            required property string eventId
+                            required property string pubkey
+                            required property string name
+                            required property string content
+                            required property string richContent
+                            required property string timeText
+                            required property string picture
+                            width: profileView.width
+                            implicitHeight: personCol.implicitHeight + 16
+                            height: implicitHeight
+                            radius: 8
+                            color: "#1c1915"
+                            Column {
+                                id: personCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 10
+                                spacing: 4
+                                RowLayout {
+                                    width: parent.width
+                                    Avatar { picture: picture; label: name; box: 24 }
+                                    Text {
+                                        text: name
+                                        color: "#e4a15a"
+                                        font.pixelSize: 13
+                                        font.weight: Font.DemiBold
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: app.openProfile(pubkey)
+                                        }
+                                    }
+                                    Text { text: timeText; color: "#6f675e"; font.pixelSize: 11 }
+                                }
+                                RichNote { body: richContent }
+                                QuietButton {
+                                    text: "View"
+                                    onClicked: app.openNote(eventId, pubkey, name, content, timeText)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    visible: app.viewing && !app.viewingProfile
+                    spacing: 8
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QuietButton {
+                            text: "Back"
+                            onClicked: app.closeNote()
+                        }
+                        Avatar { picture: app.openNotePicture; label: app.openNoteName; box: 28 }
+                        Text {
+                            text: app.openNoteName
+                            color: "#e4a15a"
+                            font.pixelSize: 14
+                            font.weight: Font.DemiBold
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: app.openProfile(app.openNotePubkey)
+                            }
+                        }
+                        Text {
+                            text: app.openNoteTime
+                            color: "#6f675e"
+                            font.pixelSize: 11
+                        }
+                    }
+                    Flickable {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Math.min(160, openNoteText.implicitHeight + 4)
+                        contentHeight: openNoteText.implicitHeight
+                        clip: true
+                        RichNote {
+                            id: openNoteText
+                            body: app.openNoteRich
+                            font.pixelSize: 15
+                        }
+                    }
+                    Row {
+                        spacing: 6
+                        QuietButton {
+                            text: "Reply"
+                            onClicked: app.beginReply(app.openNoteId, app.openNotePubkey, app.openNoteName)
+                        }
+                        QuietButton {
+                            visible: app.openNotePubkey !== app.pubkey
+                            text: app.followCount >= 0 && app.isFollowed(app.openNotePubkey) ? "Following" : "Follow"
+                            onClicked: app.toggleFollow(app.openNotePubkey)
+                        }
+                    }
+                    Text {
+                        text: "REPLIES"
+                        color: "#6f675e"
+                        font.pixelSize: 11
+                        font.letterSpacing: 1.4
+                    }
+                    ListView {
+                        id: replyView
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 8
+                        clip: true
+                        model: app.replies
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                        delegate: Rectangle {
+                            required property string eventId
+                            required property string pubkey
+                            required property string name
+                            required property string content
+                            required property string richContent
+                            required property string timeText
+                            required property string picture
+                            width: replyView.width
+                            implicitHeight: replyCol.implicitHeight + 16
+                            height: implicitHeight
+                            radius: 8
+                            color: "#1c1915"
+                            Column {
+                                id: replyCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 10
+                                spacing: 4
+                                RowLayout {
+                                    width: parent.width
+                                    Avatar { picture: picture; label: name; box: 24 }
+                                    Text {
+                                        text: name
+                                        color: "#e4a15a"
+                                        font.pixelSize: 13
+                                        font.weight: Font.DemiBold
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: app.openProfile(pubkey)
+                                        }
+                                    }
+                                    Text {
+                                        text: timeText
+                                        color: "#6f675e"
+                                        font.pixelSize: 11
+                                    }
+                                }
+                                RichNote { body: richContent }
+                                QuietButton {
+                                    text: "View"
+                                    onClicked: app.openNote(eventId, pubkey, name, content, timeText)
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        visible: replyView.count === 0
+                        text: "No replies yet."
+                        color: "#6f675e"
+                        font.pixelSize: 13
+                    }
+                }
+
                 ListView {
                     id: feedView
+                    visible: !app.viewing && !app.viewingProfile
                     anchors.fill: parent
                     anchors.margins: 8
                     spacing: 8
@@ -377,7 +678,9 @@ ApplicationWindow {
                         required property string pubkey
                         required property string name
                         required property string content
+                        required property string richContent
                         required property string timeText
+                        required property string picture
                         required property string npub
                         required property bool followed
                         width: feedView.width
@@ -397,26 +700,19 @@ ApplicationWindow {
                             RowLayout {
                                 width: parent.width
                                 spacing: 8
-                                Rectangle {
-                                    Layout.preferredWidth: 28
-                                    Layout.preferredHeight: 28
-                                    radius: 6
-                                    color: "#2e2923"
-                                    Text {
-                                        anchors.centerIn: parent
-                                        text: name.length ? name.charAt(0).toUpperCase() : "?"
-                                        color: "#e4a15a"
-                                        font.pixelSize: 13
-                                        font.weight: Font.DemiBold
-                                    }
-                                }
+                                Avatar { picture: picture; label: name; box: 28 }
                                 Text {
                                     text: name
-                                    color: "#f6f1e7"
+                                    color: "#e4a15a"
                                     font.pixelSize: 13
                                     font.weight: Font.DemiBold
                                     elide: Text.ElideRight
                                     Layout.fillWidth: true
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: app.openProfile(pubkey)
+                                    }
                                 }
                                 Text {
                                     text: timeText
@@ -424,16 +720,13 @@ ApplicationWindow {
                                     font.pixelSize: 11
                                 }
                             }
-                            Text {
-                                width: parent.width
-                                text: content
-                                color: "#f3ead7"
-                                font.pixelSize: 14
-                                wrapMode: Text.Wrap
-                                textFormat: Text.PlainText
-                            }
+                            RichNote { body: richContent }
                             Row {
                                 spacing: 6
+                                QuietButton {
+                                    text: "View"
+                                    onClicked: app.openNote(eventId, pubkey, name, content, timeText)
+                                }
                                 QuietButton {
                                     text: "Reply"
                                     onClicked: app.beginReply(eventId, pubkey, name)
@@ -453,7 +746,7 @@ ApplicationWindow {
                     anchors.centerIn: parent
                     width: parent.width - 48
                     horizontalAlignment: Text.AlignHCenter
-                    visible: feedView.count === 0
+                    visible: !app.viewing && !app.viewingProfile && feedView.count === 0
                     color: "#6f675e"
                     font.pixelSize: 14
                     wrapMode: Text.Wrap

@@ -43,6 +43,8 @@ set(NOSTARCHY_SOURCES
     src/TimelineModel.h
     src/AppController.cpp
     src/AppController.h
+    src/ImageCache.cpp
+    src/ImageCache.h
 )
 
 add_library(nostarchy_core STATIC ${NOSTARCHY_SOURCES})
