@@ -21,6 +21,7 @@ private:
     struct Entry {
         QString fileUrl;
         bool fetching = false;
+        bool failed = false;
     };
 
     QString keyFor(const QString& url) const;

@@ -37,6 +37,7 @@ public:
     void refreshPicture(const QString& remoteUrl);
     void setFormatter(const std::function<QString(const QString&, const QVector<QStringList>&)>& formatter);
     void setImageLookup(const std::function<QString(const QString&)>& lookup);
+    void setPictureLookup(const std::function<QString(const QString&)>& lookup);
 
 private:
     struct Note {
@@ -59,4 +60,5 @@ private:
     bool m_newestFirst = true;
     std::function<QString(const QString&, const QVector<QStringList>&)> m_formatter;
     std::function<QString(const QString&)> m_imageLookup;
+    std::function<QString(const QString&)> m_pictureLookup;
 };

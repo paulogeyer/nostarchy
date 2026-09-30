@@ -63,6 +63,14 @@ std::optional<QByteArray> tlv(const QByteArray& data, quint8 type) {
     return std::nullopt;
 }
 
+bool newerReplaceable(qint64 createdAt, const QString& id, qint64 oldAt, const QString& oldId) {
+    if (oldAt < 0)
+        return true;
+    if (createdAt != oldAt)
+        return createdAt > oldAt;
+    return id < oldId;
+}
+
 bool repliesTo(const NostrEvent& event, const QString& id) {
     bool tagged = false;
     for (const QStringList& tag : event.tags) {
@@ -89,6 +97,21 @@ AppController::AppController(QObject* parent)
     });
     connect(&m_pool, &RelayPool::noticeReceived, this, [this](const QString& relay, const QString& message) {
         setStatus(hostOf(relay) + QStringLiteral(": ") + message);
+    });
+    connect(&m_pool, &RelayPool::eoseReceived, this, [this](const QString&, const QString& subId) {
+        if (subId != QStringLiteral("profiles"))
+            return;
+        m_profilesInFlight = false;
+        if (!m_pendingProfiles.isEmpty() && !m_profileTimer.isActive())
+            m_profileTimer.start();
+    });
+    connect(&m_pool, &RelayPool::okReceived, this, [this](const QString&, const QString& eventId, bool accepted, const QString&) {
+        if (!accepted || eventId != m_pendingContactId)
+            return;
+        m_contactsAt = m_pendingContactAt;
+        m_contactsId = m_pendingContactId;
+        persist();
+        scheduleSave();
     });
     connect(&m_pool, &RelayPool::relayStateChanged, this, [this](const QString& url, const QString& state, const QString& detail) {
         if (!url.isEmpty()) {
@@ -123,13 +146,25 @@ AppController::AppController(QObject* parent)
     m_timeline.setImageLookup(images);
     m_replies.setImageLookup(images);
     m_profileNotes.setImageLookup(images);
+    const auto pictures = [this](const QString& pubkey) { return pictureFor(pubkey); };
+    m_timeline.setPictureLookup(pictures);
+    m_replies.setPictureLookup(pictures);
+    m_profileNotes.setPictureLookup(pictures);
+    m_people.setParent(this);
+    m_people.setNameLookup([this](const QString& pubkey) { return nameFor(pubkey); });
+    m_people.setImageLookup(images);
     connect(&m_images, &ImageCache::ready, this, [this](const QString& url) {
         m_timeline.refreshPicture(url);
         m_replies.refreshPicture(url);
         m_profileNotes.refreshPicture(url);
-        emit noteChanged();
-        emit profileChanged();
-        emit identityChanged();
+        if (m_keys && pictureFor(m_keys->pubkeyHex()) == url)
+            emit identityChanged();
+        if (pictureFor(m_openPubkey) == url)
+            emit noteChanged();
+        if (pictureFor(m_profilePubkey) == url)
+            emit profileChanged();
+        ++m_avatarEpoch;
+        emit avatarEpochChanged();
     });
     connect(&m_clock, &QTimer::timeout, &m_timeline, &TimelineModel::refreshTimes);
     connect(&m_clock, &QTimer::timeout, &m_replies, &TimelineModel::refreshTimes);
@@ -183,7 +218,22 @@ QString AppController::profileName() const {
 }
 QString AppController::profileAbout() const { return renderNote(m_profiles.value(m_profilePubkey).about, {}); }
 QString AppController::profilePicture() const { return m_images.lookup(pictureFor(m_profilePubkey)); }
+
+int AppController::avatarEpoch() const { return m_avatarEpoch; }
+
+QString AppController::avatarUrl(const QString& pubkey) {
+    const QString remote = pictureFor(pubkey);
+    const QString local = m_images.lookup(remote);
+    if (local.isEmpty())
+        m_images.prefetch(remote);
+    return local;
+}
 QString AppController::profileNpub() const { return Keys::npubFromHex(m_profilePubkey); }
+int AppController::profileFollowingCount() const { return m_profileFollowing.size(); }
+int AppController::profileFollowerCount() const { return m_profileFollowers.size(); }
+bool AppController::viewingPeople() const { return m_viewingPeople; }
+QString AppController::peopleTitle() const { return m_peopleMode == 1 ? QStringLiteral("Followers") : QStringLiteral("Following"); }
+PeopleModel* AppController::people() { return &m_people; }
 TimelineModel* AppController::replies() { return &m_replies; }
 TimelineModel* AppController::profileNotes() { return &m_profileNotes; }
 
@@ -279,6 +329,9 @@ void AppController::publishProfile(const QString& name, const QString& about) {
     meta.insert(QStringLiteral("name"), m_displayName);
     if (!m_about.isEmpty())
         meta.insert(QStringLiteral("about"), m_about);
+    const QString picture = m_profiles.value(m_keys->pubkeyHex()).picture;
+    if (!picture.isEmpty())
+        meta.insert(QStringLiteral("picture"), picture);
     NostrEvent event;
     event.kind = 0;
     event.createdAt = QDateTime::currentSecsSinceEpoch();
@@ -373,7 +426,18 @@ void AppController::openNote(const QString& eventId, const QString& pubkey, cons
     m_openName = name;
     m_openContent = content;
     m_openTime = timeText;
-    m_openTags = m_noteTags.value(id);
+    if (m_noteCache.contains(id)) {
+        const NostrEvent& cached = m_noteCache.value(id);
+        if (m_openContent.isEmpty())
+            m_openContent = cached.content;
+        if (m_openPubkey.isEmpty())
+            m_openPubkey = cached.pubkey;
+        if (m_openName.isEmpty())
+            m_openName = nameFor(cached.pubkey);
+        m_openTags = cached.tags;
+    } else {
+        m_openTags = m_noteTags.value(id);
+    }
     m_replies.clear();
     emit noteChanged();
     noteAuthor(m_openPubkey);
@@ -408,6 +472,10 @@ void AppController::openProfile(const QString& pubkeyOrNpub) {
     }
     m_profilePubkey = pubkey;
     m_viewingProfile = true;
+    m_viewingPeople = false;
+    m_peopleMode = 0;
+    emit peopleChanged();
+    applySocial(pubkey);
     m_profileNotes.clear();
     for (const NostrEvent& cached : m_noteCache) {
         if (cached.pubkey == pubkey)
@@ -424,15 +492,86 @@ void AppController::openProfile(const QString& pubkeyOrNpub) {
     notes.insert(QStringLiteral("authors"), QJsonArray{pubkey});
     notes.insert(QStringLiteral("limit"), 40);
     m_pool.subscribe(QStringLiteral("person"), QJsonArray{meta, notes});
+    QJsonObject following;
+    following.insert(QStringLiteral("kinds"), QJsonArray{3});
+    following.insert(QStringLiteral("authors"), QJsonArray{pubkey});
+    following.insert(QStringLiteral("limit"), 1);
+    QJsonObject followers;
+    followers.insert(QStringLiteral("kinds"), QJsonArray{3});
+    followers.insert(QStringLiteral("#p"), QJsonArray{pubkey});
+    followers.insert(QStringLiteral("limit"), 200);
+    m_pool.subscribe(QStringLiteral("graph"), QJsonArray{following, followers});
 }
 
 void AppController::closeProfile() {
     if (!m_viewingProfile)
         return;
     m_viewingProfile = false;
+    m_viewingPeople = false;
     m_profileNotes.clear();
     m_pool.unsubscribe(QStringLiteral("person"));
+    m_pool.unsubscribe(QStringLiteral("graph"));
     emit profileChanged();
+    emit peopleChanged();
+}
+
+void AppController::showFollowing() {
+    m_peopleMode = 0;
+    m_viewingPeople = true;
+    m_people.setPubkeys(m_profileFollowing);
+    for (const QString& pubkey : m_profileFollowing)
+        noteAuthor(pubkey);
+    emit peopleChanged();
+}
+
+void AppController::showFollowers() {
+    m_peopleMode = 1;
+    m_viewingPeople = true;
+    m_people.setPubkeys(m_profileFollowers);
+    for (const QString& pubkey : m_profileFollowers)
+        noteAuthor(pubkey);
+    emit peopleChanged();
+}
+
+void AppController::closePeople() {
+    if (!m_viewingPeople)
+        return;
+    m_viewingPeople = false;
+    emit peopleChanged();
+}
+
+void AppController::applySocial(const QString& pubkey) {
+    const Social social = m_social.value(pubkey);
+    m_profileFollowing = social.following;
+    m_profileFollowers = social.followers;
+    emit profileChanged();
+}
+
+void AppController::rememberSocial(const NostrEvent& event) {
+    QStringList following;
+    for (const QStringList& tag : event.tags) {
+        if (tag.size() >= 2 && tag.at(0) == QStringLiteral("p") && tag.at(1).size() == 64)
+            following.append(tag.at(1).toLower());
+    }
+    Social& own = m_social[event.pubkey];
+    if (event.createdAt >= own.followingAt) {
+        own.following = following;
+        own.followingAt = event.createdAt;
+    }
+    if (!m_profilePubkey.isEmpty() && event.pubkey != m_profilePubkey && following.contains(m_profilePubkey)) {
+        Social& viewed = m_social[m_profilePubkey];
+        if (!viewed.followers.contains(event.pubkey) && viewed.followers.size() < 300) {
+            viewed.followers.append(event.pubkey);
+            viewed.followersAt = event.createdAt;
+        }
+    }
+    if (event.pubkey == m_profilePubkey)
+        applySocial(event.pubkey);
+    else if (!m_profilePubkey.isEmpty())
+        applySocial(m_profilePubkey);
+    if (m_viewingPeople)
+        m_people.setPubkeys(m_peopleMode == 1 ? m_profileFollowers : m_profileFollowing);
+    scheduleSave();
 }
 
 void AppController::openLink(const QString& link) {
@@ -484,6 +623,11 @@ void AppController::adopt(Keys keys) {
     m_pendingProfiles.clear();
     m_timeline.clear();
     m_noteCache.clear();
+    m_writeRelays.clear();
+    m_pool.clearOutbox();
+    const QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    QFile::remove(cacheDir + QStringLiteral("/feed.json"));
+    QFile::remove(cacheDir + QStringLiteral("/following.json"));
     closeProfile();
     closeNote();
     cancelReply();
@@ -519,14 +663,16 @@ void AppController::load() {
             m_follows.insert(pubkey.toLower());
     }
     m_contactsAt = settings.value(QStringLiteral("contactsAt"), -1).toLongLong();
-    loadCache();
-    if (m_feedMode == 1 && m_follows.isEmpty())
-        m_feedMode = 0;
     const QString secret = settings.value(QStringLiteral("identity/secret")).toString();
     if (!secret.isEmpty()) {
         if (auto keys = Keys::fromSecretHex(secret))
             m_keys = std::move(*keys);
     }
+    const bool fastFollows = m_feedMode == 1 && loadFollowingCache();
+    if (!fastFollows)
+        loadCache();
+    if (m_feedMode == 1 && m_follows.isEmpty())
+        m_feedMode = 0;
     QStringList relays = settings.value(QStringLiteral("relays")).toStringList();
     if (relays.isEmpty())
         relays = defaultRelays();
@@ -537,6 +683,11 @@ void AppController::load() {
     } else {
         m_pool.setRelays(relays);
     }
+    if (fastFollows)
+        QTimer::singleShot(0, this, [this] {
+            loadCache();
+            refillTimeline();
+        });
 }
 
 void AppController::connectDefault() {
@@ -562,17 +713,28 @@ void AppController::subscribeFeed() {
     QJsonObject filter;
     filter.insert(QStringLiteral("kinds"), QJsonArray{1});
     filter.insert(QStringLiteral("limit"), m_feedMode == 1 && !m_follows.isEmpty() ? 50 : 30);
-    if (m_feedMode == 1 && !m_follows.isEmpty()) {
-        QJsonArray authors;
-        authors.append(m_keys->pubkeyHex());
-        for (const QString& pubkey : m_follows)
-            authors.append(pubkey);
-        filter.insert(QStringLiteral("authors"), authors);
-        m_pool.subscribe(QStringLiteral("following"), QJsonArray{filter});
-        subscribeRelayLists();
-    } else {
+    if (m_feedMode == 1 && m_follows.isEmpty()) {
+        m_pool.unsubscribe(QStringLiteral("feed"));
         m_pool.unsubscribe(QStringLiteral("following"));
+        return;
     }
+    if (m_feedMode == 1) {
+        QJsonArray filters;
+        QStringList people(m_follows.cbegin(), m_follows.cend());
+        people.prepend(m_keys->pubkeyHex());
+        for (const QString& pubkey : people) {
+            QJsonObject one;
+            one.insert(QStringLiteral("kinds"), QJsonArray{1});
+            one.insert(QStringLiteral("authors"), QJsonArray{pubkey});
+            one.insert(QStringLiteral("limit"), 20);
+            filters.append(one);
+        }
+        m_pool.subscribe(QStringLiteral("following"), filters);
+        m_pool.subscribe(QStringLiteral("feed"), filters);
+        subscribeRelayLists();
+        return;
+    }
+    m_pool.unsubscribe(QStringLiteral("following"));
     m_pool.subscribe(QStringLiteral("feed"), QJsonArray{filter});
 }
 
@@ -609,25 +771,44 @@ void AppController::subscribeProfiles() {
         filter.insert(QStringLiteral("authors"), authors);
         filters.append(filter);
     }
-    if (filters.isEmpty())
+    if (filters.isEmpty() || m_profilesInFlight)
         return;
+    for (const QJsonValue& filter : filters) {
+        const QJsonArray authors = filter.toObject().value(QStringLiteral("authors")).toArray();
+        for (const QJsonValue& author : authors) {
+            const QString pubkey = author.toString();
+            m_pendingProfiles.remove(pubkey);
+            m_profileAsked.insert(pubkey);
+        }
+    }
+    m_profilesInFlight = true;
     m_pool.subscribe(QStringLiteral("profiles"), filters);
 }
 
 void AppController::noteAuthor(const QString& pubkey) {
-    if (pubkey.size() != 64 || m_profiles.value(pubkey).createdAt > 0)
+    if (pubkey.size() != 64 || m_profiles.value(pubkey).createdAt > 0 || m_profileAsked.contains(pubkey))
         return;
-    const bool added = !m_pendingProfiles.contains(pubkey);
+    if (m_pendingProfiles.size() >= 200 && !m_pendingProfiles.contains(pubkey))
+        return;
     m_pendingProfiles.insert(pubkey);
-    if (added)
-        m_profileTimer.start();
+    if (m_profilesInFlight || m_profileTimer.isActive())
+        return;
+    m_profileTimer.start();
 }
 
 void AppController::handleEvent(const QString&, const QString& subId, const QJsonObject& object) {
     auto event = NostrEvent::fromJson(object);
     if (!event)
         return;
+    if (m_seenEventIds.contains(event->id))
+        return;
+    if (m_seenEventIds.size() > 4000)
+        m_seenEventIds.clear();
+    m_seenEventIds.insert(event->id);
     if (!event->verify())
+        return;
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    if (event->kind == 1 && (event->createdAt > now + 120 || event->createdAt < now - 60LL * 60 * 24 * 365 * 5))
         return;
     if (event->kind == 0) {
         handleProfile(*event);
@@ -636,17 +817,26 @@ void AppController::handleEvent(const QString&, const QString& subId, const QJso
     if (event->kind == 10002) {
         if (!m_follows.contains(event->pubkey))
             return;
+        if (!newerReplaceable(event->createdAt, event->id, m_relayListAt.value(event->pubkey, -1), m_relayListId.value(event->pubkey)))
+            return;
+        QStringList writes;
         for (const QStringList& tag : event->tags) {
             if (tag.size() < 2 || tag.at(0) != QStringLiteral("r"))
                 continue;
             if (tag.size() >= 3 && tag.at(2) == QStringLiteral("read"))
                 continue;
-            m_pool.addOutboxRelay(tag.at(1));
+            writes.append(tag.at(1));
         }
+        m_relayListAt.insert(event->pubkey, event->createdAt);
+        m_relayListId.insert(event->pubkey, event->id);
+        m_writeRelays.insert(event->pubkey, writes);
+        rebuildOutbox();
         return;
     }
-    if (event->kind == 3 && m_keys && event->pubkey == m_keys->pubkeyHex()) {
-        handleContacts(*event);
+    if (event->kind == 3) {
+        if (m_keys && event->pubkey == m_keys->pubkeyHex())
+            handleContacts(*event);
+        rememberSocial(*event);
         return;
     }
     if (event->kind != 1)
@@ -683,7 +873,9 @@ void AppController::handleEvent(const QString&, const QString& subId, const QJso
 
 void AppController::handleProfile(const NostrEvent& event) {
     Profile& profile = m_profiles[event.pubkey];
-    if (profile.createdAt > event.createdAt)
+    if (profile.createdAt > 0 && !newerReplaceable(event.createdAt, event.id, profile.createdAt, profile.id))
+        return;
+    if (m_profiles.size() > 400 && !m_profiles.contains(event.pubkey))
         return;
     const QJsonDocument doc = QJsonDocument::fromJson(event.content.toUtf8());
     const QJsonObject meta = doc.object();
@@ -697,12 +889,17 @@ void AppController::handleProfile(const NostrEvent& event) {
     profile.picture = safePicture(meta.value(QStringLiteral("picture")).toString());
     if (!profile.picture.isEmpty())
         m_images.prefetch(profile.picture);
+    profile.id = event.id;
     profile.createdAt = event.createdAt;
     m_pendingProfiles.remove(event.pubkey);
     m_timeline.setAuthor(event.pubkey, profile.name, profile.picture);
     m_replies.setAuthor(event.pubkey, profile.name, profile.picture);
     m_profileNotes.setAuthor(event.pubkey, profile.name, profile.picture);
-    m_mentionTimer.start();
+    m_people.setAuthor(event.pubkey, profile.name, profile.picture);
+    ++m_avatarEpoch;
+    emit avatarEpochChanged();
+    if (!m_mentionTimer.isActive())
+        m_mentionTimer.start();
     if (event.pubkey == m_openPubkey && !profile.name.isEmpty())
         m_openName = profile.name;
     if (event.pubkey == m_openPubkey || event.pubkey == m_profilePubkey)
@@ -719,15 +916,23 @@ void AppController::handleProfile(const NostrEvent& event) {
 }
 
 void AppController::handleContacts(const NostrEvent& event) {
-    if (event.createdAt < m_contactsAt)
+    if (m_pendingContactAt >= 0 && event.createdAt < m_pendingContactAt)
         return;
-    m_contactsAt = event.createdAt;
+    if (!newerReplaceable(event.createdAt, event.id, m_contactsAt, m_contactsId))
+        return;
     QSet<QString> follows;
     for (const QStringList& tag : event.tags) {
         if (tag.size() >= 2 && tag.at(0) == QStringLiteral("p") && tag.at(1).size() == 64)
             follows.insert(tag.at(1).toLower());
     }
+    m_contactsAt = event.createdAt;
+    m_contactsId = event.id;
+    m_lastContactTags = event.tags;
+    if (follows == m_follows)
+        return;
     m_follows = follows;
+    m_writeRelays.clear();
+    rebuildOutbox();
     m_timeline.setFollows(m_follows);
     emit followsChanged();
     for (const QString& pubkey : m_follows)
@@ -747,13 +952,23 @@ void AppController::publishContacts() {
     event.kind = 3;
     event.createdAt = QDateTime::currentSecsSinceEpoch();
     event.content = QString();
-    for (const QString& pubkey : m_follows)
-        event.tags.append({QStringLiteral("p"), pubkey, QString()});
+    QHash<QString, QStringList> previous;
+    for (const QStringList& tag : m_lastContactTags) {
+        if (tag.size() >= 2 && tag.at(0) == QStringLiteral("p"))
+            previous.insert(tag.at(1).toLower(), tag);
+    }
+    for (const QString& pubkey : m_follows) {
+        if (previous.contains(pubkey))
+            event.tags.append(previous.value(pubkey));
+        else
+            event.tags.append({QStringLiteral("p"), pubkey, QString()});
+    }
     if (!event.sign(*m_keys)) {
         setStatus(QStringLiteral("could not sign contact list"));
         return;
     }
-    m_contactsAt = event.createdAt;
+    m_pendingContactAt = event.createdAt;
+    m_pendingContactId = event.id;
     const int sent = m_pool.publish(event.toWire());
     setStatus(sent ? QStringLiteral("follow list sent to %1 relays").arg(sent)
                    : QStringLiteral("follow list not sent — no relay connected"));
@@ -903,23 +1118,59 @@ void AppController::indexPeople(const NostrEvent& event) {
 }
 
 void AppController::scheduleSave() {
-    m_saveTimer.start();
+    if (!m_saveTimer.isActive())
+        m_saveTimer.start();
+}
+
+void AppController::rebuildOutbox() {
+    m_pool.clearOutbox();
+    QSet<QString> urls;
+    for (const QString& pubkey : m_follows) {
+        for (const QString& url : m_writeRelays.value(pubkey))
+            urls.insert(url);
+    }
+    for (const QString& url : urls)
+        m_pool.addOutboxRelay(url);
 }
 
 void AppController::rememberNote(const NostrEvent& event) {
+    if (m_noteCache.contains(event.id))
+        return;
     m_noteCache.insert(event.id, event);
-    if (m_noteCache.size() > 200) {
-        QString oldestId;
+    trimNoteCache();
+    scheduleSave();
+}
+
+void AppController::trimNoteCache() {
+    const int cap = 200;
+    const QString mine = pubkey();
+    auto pinned = [this, &mine](const NostrEvent& event) {
+        return event.pubkey == mine || m_follows.contains(event.pubkey);
+    };
+    while (m_noteCache.size() > cap) {
+        QString drop;
         qint64 oldest = std::numeric_limits<qint64>::max();
         for (auto it = m_noteCache.cbegin(); it != m_noteCache.cend(); ++it) {
+            if (pinned(*it))
+                continue;
             if (it->createdAt < oldest) {
                 oldest = it->createdAt;
-                oldestId = it.key();
+                drop = it.key();
             }
         }
-        m_noteCache.remove(oldestId);
+        if (drop.isEmpty()) {
+            for (auto it = m_noteCache.cbegin(); it != m_noteCache.cend(); ++it) {
+                if (it->createdAt < oldest) {
+                    oldest = it->createdAt;
+                    drop = it.key();
+                }
+            }
+        }
+        if (drop.isEmpty())
+            break;
+        m_noteCache.remove(drop);
+        m_noteTags.remove(drop);
     }
-    scheduleSave();
 }
 
 void AppController::refillTimeline() {
@@ -945,12 +1196,88 @@ void AppController::refillTimeline() {
     }
 }
 
+bool AppController::loadFollowingCache() {
+    const QString path = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/following.json");
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+    const QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
+    const QString owner = root.value(QStringLiteral("owner")).toString();
+    if (m_keys && !owner.isEmpty() && owner != m_keys->pubkeyHex())
+        return false;
+    const QJsonObject profiles = root.value(QStringLiteral("profiles")).toObject();
+    for (auto it = profiles.begin(); it != profiles.end(); ++it) {
+        if (it.key().size() != 64)
+            continue;
+        const QJsonObject item = it.value().toObject();
+        Profile profile;
+        profile.name = item.value(QStringLiteral("name")).toString();
+        profile.picture = item.value(QStringLiteral("picture")).toString();
+        profile.createdAt = item.value(QStringLiteral("created_at")).toInteger();
+        if (profile.createdAt > m_profiles.value(it.key()).createdAt)
+            m_profiles.insert(it.key(), profile);
+    }
+    int loaded = 0;
+    for (const QJsonValue& item : root.value(QStringLiteral("notes")).toArray()) {
+        auto event = NostrEvent::fromJson(item.toObject());
+        if (!event || event->kind != 1 || event->id.size() != 64)
+            continue;
+        m_noteCache.insert(event->id, *event);
+        ++loaded;
+    }
+    return loaded > 0;
+}
+
+void AppController::saveFollowingCache() {
+    const QString mine = pubkey();
+    QList<NostrEvent> notes;
+    for (const NostrEvent& event : m_noteCache) {
+        if (event.pubkey == mine || m_follows.contains(event.pubkey))
+            notes.append(event);
+    }
+    std::sort(notes.begin(), notes.end(), [](const NostrEvent& a, const NostrEvent& b) {
+        return a.createdAt > b.createdAt;
+    });
+    if (notes.size() > 80)
+        notes.resize(80);
+    QJsonArray noteArray;
+    QJsonObject profiles;
+    for (const NostrEvent& event : notes) {
+        noteArray.append(QJsonDocument::fromJson(event.toWire()).object());
+        if (profiles.contains(event.pubkey))
+            continue;
+        const Profile profile = m_profiles.value(event.pubkey);
+        if (profile.createdAt <= 0 && profile.name.isEmpty() && profile.picture.isEmpty())
+            continue;
+        QJsonObject item;
+        item.insert(QStringLiteral("name"), profile.name);
+        item.insert(QStringLiteral("picture"), profile.picture);
+        item.insert(QStringLiteral("created_at"), profile.createdAt);
+        profiles.insert(event.pubkey, item);
+    }
+    QJsonObject root;
+    if (m_keys)
+        root.insert(QStringLiteral("owner"), m_keys->pubkeyHex());
+    root.insert(QStringLiteral("notes"), noteArray);
+    root.insert(QStringLiteral("profiles"), profiles);
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    QDir().mkpath(dir);
+    QSaveFile file(dir + QStringLiteral("/following.json"));
+    if (!file.open(QIODevice::WriteOnly))
+        return;
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+    file.commit();
+}
+
 void AppController::loadCache() {
     const QString path = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/feed.json");
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
         return;
     const QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
+    const QString owner = root.value(QStringLiteral("owner")).toString();
+    if (m_keys && !owner.isEmpty() && owner != m_keys->pubkeyHex())
+        return;
     const QJsonObject profiles = root.value(QStringLiteral("profiles")).toObject();
     for (auto it = profiles.begin(); it != profiles.end(); ++it) {
         if (it.key().size() != 64)
@@ -963,8 +1290,6 @@ void AppController::loadCache() {
         profile.createdAt = item.value(QStringLiteral("created_at")).toInteger();
         if (profile.createdAt > m_profiles.value(it.key()).createdAt)
             m_profiles.insert(it.key(), profile);
-        if (!profile.picture.isEmpty())
-            m_images.prefetch(profile.picture);
     }
     const qint64 contactsAt = root.value(QStringLiteral("contactsAt")).toInteger(-1);
     if (contactsAt > m_contactsAt) {
@@ -976,6 +1301,30 @@ void AppController::loadCache() {
                 m_follows.insert(pubkey);
         }
     }
+    const QJsonObject social = root.value(QStringLiteral("social")).toObject();
+    for (auto it = social.begin(); it != social.end(); ++it) {
+        if (it.key().size() != 64)
+            continue;
+        const QJsonObject item = it.value().toObject();
+        Social entry;
+        const QJsonArray following = item.value(QStringLiteral("following")).toArray();
+        const QJsonArray followers = item.value(QStringLiteral("followers")).toArray();
+        const int followCap = qMin(following.size(), 80);
+        const int followerCap = qMin(followers.size(), 40);
+        for (int i = 0; i < followCap; ++i) {
+            const QString pubkey = following.at(i).toString().toLower();
+            if (pubkey.size() == 64)
+                entry.following.append(pubkey);
+        }
+        for (int i = 0; i < followerCap; ++i) {
+            const QString pubkey = followers.at(i).toString().toLower();
+            if (pubkey.size() == 64)
+                entry.followers.append(pubkey);
+        }
+        entry.followingAt = item.value(QStringLiteral("followingAt")).toInteger(-1);
+        entry.followersAt = item.value(QStringLiteral("followersAt")).toInteger(0);
+        m_social.insert(it.key(), entry);
+    }
     for (const QJsonValue& item : root.value(QStringLiteral("notes")).toArray()) {
         auto event = NostrEvent::fromJson(item.toObject());
         if (event && event->kind == 1 && event->id.size() == 64)
@@ -984,12 +1333,22 @@ void AppController::loadCache() {
 }
 
 void AppController::saveCache() {
-    QList<NostrEvent> notes = m_noteCache.values();
-    std::sort(notes.begin(), notes.end(), [](const NostrEvent& a, const NostrEvent& b) {
+    QList<NostrEvent> all = m_noteCache.values();
+    std::sort(all.begin(), all.end(), [](const NostrEvent& a, const NostrEvent& b) {
         return a.createdAt > b.createdAt;
     });
-    if (notes.size() > 120)
-        notes.resize(120);
+    const QString mine = pubkey();
+    QList<NostrEvent> notes;
+    QList<NostrEvent> other;
+    for (const NostrEvent& event : all) {
+        if (event.pubkey == mine || m_follows.contains(event.pubkey)) {
+            if (notes.size() < 100)
+                notes.append(event);
+        } else if (other.size() < 40) {
+            other.append(event);
+        }
+    }
+    notes += other;
     QJsonArray noteArray;
     for (const NostrEvent& event : notes)
         noteArray.append(QJsonDocument::fromJson(event.toWire()).object());
@@ -1007,10 +1366,32 @@ void AppController::saveCache() {
     QJsonArray follows;
     for (const QString& pubkey : m_follows)
         follows.append(pubkey);
+    QJsonObject social;
+    for (auto it = m_social.cbegin(); it != m_social.cend(); ++it) {
+        if (it->following.isEmpty() && it->followers.isEmpty())
+            continue;
+        QJsonObject item;
+        QJsonArray following;
+        QJsonArray followers;
+        const int followCap = qMin(it->following.size(), 80);
+        const int followerCap = qMin(it->followers.size(), 40);
+        for (int i = 0; i < followCap; ++i)
+            following.append(it->following.at(i));
+        for (int i = 0; i < followerCap; ++i)
+            followers.append(it->followers.at(i));
+        item.insert(QStringLiteral("following"), following);
+        item.insert(QStringLiteral("followers"), followers);
+        item.insert(QStringLiteral("followingAt"), it->followingAt);
+        item.insert(QStringLiteral("followersAt"), it->followersAt);
+        social.insert(it.key(), item);
+    }
     QJsonObject root;
+    if (m_keys)
+        root.insert(QStringLiteral("owner"), m_keys->pubkeyHex());
     root.insert(QStringLiteral("profiles"), profiles);
     root.insert(QStringLiteral("notes"), noteArray);
     root.insert(QStringLiteral("follows"), follows);
+    root.insert(QStringLiteral("social"), social);
     root.insert(QStringLiteral("contactsAt"), m_contactsAt);
     const QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
     QDir().mkpath(dir);
@@ -1019,6 +1400,7 @@ void AppController::saveCache() {
         return;
     file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
     file.commit();
+    saveFollowingCache();
 }
 
 void AppController::setStatus(const QString& text) {

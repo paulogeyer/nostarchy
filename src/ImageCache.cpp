@@ -32,7 +32,7 @@ QString ImageCache::findExisting(const QString& key) const {
     for (const char* ext : {".jpg", ".png", ".webp", ".gif"}) {
         const QString path = base + QLatin1String(ext);
         if (QFile::exists(path))
-            return QUrl::fromLocalFile(path).toString();
+            return QStringLiteral("image://avatars/") + key;
     }
     return {};
 }
@@ -41,8 +41,12 @@ QString ImageCache::lookup(const QString& url) const {
     if (url.isEmpty())
         return {};
     const auto it = m_entries.constFind(url);
-    if (it != m_entries.cend() && !it->fileUrl.isEmpty())
-        return it->fileUrl;
+    if (it != m_entries.cend()) {
+        if (it->failed)
+            return {};
+        if (!it->fileUrl.isEmpty())
+            return it->fileUrl;
+    }
     const QString found = findExisting(keyFor(url));
     if (!found.isEmpty())
         m_entries[url].fileUrl = found;
@@ -59,7 +63,7 @@ void ImageCache::prefetch(const QString& url) {
         return;
     }
     Entry& entry = m_entries[url];
-    if (entry.fetching)
+    if (entry.fetching || entry.failed)
         return;
     entry.fetching = true;
     m_queue.enqueue(url);
@@ -70,21 +74,31 @@ void ImageCache::pump() {
     while (m_active < kMaxActive && !m_queue.isEmpty()) {
         const QString url = m_queue.dequeue();
         QNetworkRequest request{QUrl(url)};
-        request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("nostarchy/0.1"));
+        request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("Mozilla/5.0 nostarchy/0.1"));
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
         request.setTransferTimeout(12000);
         QNetworkReply* reply = m_net.get(request);
         ++m_active;
+        connect(reply, &QNetworkReply::downloadProgress, reply, [reply](qint64 received, qint64) {
+            if (received > kMaxBytes)
+                reply->abort();
+        });
         connect(reply, &QNetworkReply::finished, this, [this, reply, url] {
             --m_active;
-            const QByteArray bytes = reply->readAll();
+            QByteArray bytes;
+            if (reply->isOpen() && reply->error() == QNetworkReply::NoError)
+                bytes = reply->readAll();
             const QString type = reply->header(QNetworkRequest::ContentTypeHeader).toString();
-            const bool ok = reply->error() == QNetworkReply::NoError && bytes.size() <= kMaxBytes;
+            const bool ok = reply->error() == QNetworkReply::NoError && !bytes.isEmpty() && bytes.size() <= kMaxBytes;
             reply->deleteLater();
             if (ok)
                 finish(url, bytes, type);
-            else
-                m_entries[url].fetching = false;
+            else {
+                Entry& entry = m_entries[url];
+                entry.fetching = false;
+                entry.failed = true;
+            }
             pump();
         });
     }
@@ -114,16 +128,20 @@ QString ImageCache::extensionFor(const QByteArray& bytes, const QString& content
 void ImageCache::finish(const QString& url, const QByteArray& bytes, const QString& contentType) {
     const QString ext = extensionFor(bytes, contentType);
     if (ext.isEmpty() || bytes.size() < 32) {
-        m_entries[url].fetching = false;
+        Entry& entry = m_entries[url];
+        entry.fetching = false;
+        entry.failed = true;
         return;
     }
     const QString path = m_dir + QLatin1Char('/') + keyFor(url) + ext;
     QSaveFile file(path);
     if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
-        m_entries[url].fetching = false;
+        Entry& entry = m_entries[url];
+        entry.fetching = false;
+        entry.failed = true;
         return;
     }
-    m_entries[url].fileUrl = QUrl::fromLocalFile(path).toString();
+    m_entries[url].fileUrl = QStringLiteral("image://avatars/") + keyFor(url);
     m_entries[url].fetching = false;
     emit ready(url);
 }

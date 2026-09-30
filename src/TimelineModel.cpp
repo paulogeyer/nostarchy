@@ -46,7 +46,12 @@ QVariant TimelineModel::data(const QModelIndex& index, int role) const {
     case TimeRole: return formatAge(note.createdAt);
     case NpubRole: return note.npub;
     case FollowedRole: return m_follows.contains(note.pubkey);
-    case PictureRole: return note.picture.isEmpty() || !m_imageLookup ? QString() : m_imageLookup(note.picture);
+    case PictureRole: {
+        const QString remote = m_pictureLookup ? m_pictureLookup(note.pubkey) : note.picture;
+        if (remote.isEmpty() || !m_imageLookup)
+            return {};
+        return m_imageLookup(remote);
+    }
     case RichContentRole: return note.rich.isEmpty() ? note.content : note.rich;
     default: return {};
     }
@@ -116,9 +121,14 @@ void TimelineModel::setImageLookup(const std::function<QString(const QString&)>&
     m_imageLookup = lookup;
 }
 
+void TimelineModel::setPictureLookup(const std::function<QString(const QString&)>& lookup) {
+    m_pictureLookup = lookup;
+}
+
 void TimelineModel::refreshPicture(const QString& remoteUrl) {
     for (int i = 0; i < m_notes.size(); ++i) {
-        if (m_notes.at(i).picture != remoteUrl)
+        const QString remote = m_pictureLookup ? m_pictureLookup(m_notes.at(i).pubkey) : m_notes.at(i).picture;
+        if (remote != remoteUrl && m_notes.at(i).picture != remoteUrl)
             continue;
         const QModelIndex idx = index(i);
         emit dataChanged(idx, idx, {PictureRole});

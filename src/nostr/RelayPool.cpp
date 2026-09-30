@@ -26,7 +26,23 @@ QString normalizeRelay(QString raw) {
     if (url.path().isEmpty())
         url.setPath(QStringLiteral("/"));
     url.setFragment({});
+    if (url.hasQuery() || url.host().contains(QStringLiteral("nwc"), Qt::CaseInsensitive))
+        return {};
+    const QString path = url.path().toLower();
+    if (path.contains(QStringLiteral("inbox")))
+        return {};
+    for (const QString& part : url.path().split(QLatin1Char('/'), Qt::SkipEmptyParts)) {
+        if (part.size() >= 20)
+            return {};
+    }
     return url.toString(QUrl::FullyEncoded);
+}
+
+QString logRelay(const QString& url) {
+    const QUrl parsed(url);
+    if (parsed.path().size() > 1 || parsed.hasQuery())
+        return parsed.scheme() + QStringLiteral("://") + parsed.host() + QStringLiteral("/");
+    return url;
 }
 
 }
@@ -39,15 +55,24 @@ public:
         , m_pool(pool) {
         m_retry.setSingleShot(true);
         connect(&m_retry, &QTimer::timeout, this, [this] { ensureOpen(); });
+        m_stable.setSingleShot(true);
+        connect(&m_stable, &QTimer::timeout, this, [this] { m_attempt = 0; });
         connect(&m_socket, &WebSocketClient::connected, this, [this] {
             m_open = true;
-            m_attempt = 0;
             m_detail.clear();
+            m_stable.start(25000);
+            qInfo().noquote() << "relay open" << logRelay(m_url);
             emit m_pool->relayStateChanged(m_url, QStringLiteral("open"), QString());
-            m_pool->sendSubscriptions(this);
+            QTimer::singleShot(0, this, [this] {
+                if (m_open && !m_authPending)
+                    m_pool->sendSubscriptions(this);
+            });
         });
         connect(&m_socket, &WebSocketClient::disconnected, this, [this] {
             m_open = false;
+            m_authPending = false;
+            m_authId.clear();
+            m_stable.stop();
             if (!m_wanted)
                 return;
             emit m_pool->relayStateChanged(m_url, QStringLiteral("closed"), m_detail);
@@ -55,8 +80,24 @@ public:
         });
         connect(&m_socket, &WebSocketClient::errorOccurred, this, [this](const QString& message) {
             m_detail = message;
-            qInfo().noquote() << "relay" << m_url << message;
+            qInfo().noquote() << "relay" << logRelay(m_url) << message;
             emit m_pool->relayStateChanged(m_url, m_open ? QStringLiteral("open") : QStringLiteral("error"), message);
+        });
+        connect(&m_socket, &WebSocketClient::redirected, this, [this](const QUrl& url) {
+            const QString next = normalizeRelay(url.toString());
+            if (next.isEmpty() || next == m_url) {
+                m_wanted = false;
+                m_retry.stop();
+                qInfo().noquote() << "relay dropped" << logRelay(m_url);
+                return;
+            }
+            m_pool->retarget(this, next);
+            QTimer::singleShot(0, this, [this] { ensureOpen(); });
+        });
+        connect(&m_socket, &WebSocketClient::rejected, this, [this](const QString&) {
+            m_wanted = false;
+            m_retry.stop();
+            qInfo().noquote() << "relay dropped" << logRelay(m_url);
         });
         connect(&m_socket, &WebSocketClient::textMessageReceived, this, [this](const QString& text) {
             handle(text);
@@ -77,6 +118,7 @@ public:
 
     bool open() const { return m_open; }
     QString url() const { return m_url; }
+    void setUrl(const QString& url) { m_url = url; }
 
 private:
     void ensureOpen() {
@@ -107,9 +149,20 @@ private:
             emit m_pool->eventReceived(m_url, arr.at(1).toString(), arr.at(2).toObject());
         } else if (type == QStringLiteral("AUTH") && arr.size() >= 2) {
             const QByteArray event = m_pool->authEvent(m_url, arr.at(1).toString());
-            if (!event.isEmpty())
-                send("[\"AUTH\"," + event + "]");
+            if (event.isEmpty())
+                return;
+            const QJsonObject signedEvent = QJsonDocument::fromJson(event).object();
+            m_authId = signedEvent.value(QStringLiteral("id")).toString();
+            m_authPending = true;
+            m_open = true;
+            send("[\"AUTH\"," + event + "]");
         } else if (type == QStringLiteral("OK") && arr.size() >= 4) {
+            if (!m_authId.isEmpty() && arr.at(1).toString() == m_authId) {
+                m_authPending = false;
+                m_authId.clear();
+                if (arr.at(2).toBool())
+                    m_pool->sendSubscriptions(this);
+            }
             emit m_pool->okReceived(m_url, arr.at(1).toString(), arr.at(2).toBool(), arr.at(3).toString());
         } else if (type == QStringLiteral("EOSE") && arr.size() >= 2) {
             m_detail = QStringLiteral("live");
@@ -132,10 +185,13 @@ private:
     RelayPool* m_pool;
     WebSocketClient m_socket;
     QTimer m_retry;
+    QTimer m_stable;
     QString m_detail;
+    QString m_authId;
     int m_attempt = 0;
     bool m_open = false;
     bool m_wanted = true;
+    bool m_authPending = false;
 };
 
 RelayPool::RelayPool(QObject* parent)
@@ -180,7 +236,28 @@ void RelayPool::addMetadataRelay(const QString& raw) {
 
 bool RelayPool::isMetadataSub(const QString& id) {
     return id == QStringLiteral("profiles") || id == QStringLiteral("person") || id == QStringLiteral("thread")
-        || id == QStringLiteral("relaylists");
+        || id == QStringLiteral("relaylists") || id == QStringLiteral("graph");
+}
+
+void RelayPool::retarget(Session* session, const QString& raw) {
+    const QString url = normalizeRelay(raw);
+    if (!session || url.isEmpty() || url == session->url())
+        return;
+    if (m_sessions.contains(url)) {
+        session->stop();
+        return;
+    }
+    const QString old = session->url();
+    m_sessions.remove(old);
+    session->setUrl(url);
+    m_sessions.insert(url, session);
+    if (m_outbox.remove(old))
+        m_outbox.insert(url);
+    if (m_metadata.remove(old))
+        m_metadata.insert(url);
+    const int at = m_order.indexOf(old);
+    if (at >= 0)
+        m_order[at] = url;
 }
 
 void RelayPool::addOutboxRelay(const QString& raw) {
@@ -194,6 +271,20 @@ void RelayPool::addOutboxRelay(const QString& raw) {
         m_sessions.insert(url, new Session(url, this));
     else if (Session* session = m_sessions.value(url); session->open())
         sendSubscriptions(session);
+}
+
+void RelayPool::clearOutbox() {
+    const QStringList urls = m_outbox.values();
+    m_outbox.clear();
+    for (const QString& url : urls) {
+        if (m_order.contains(url) || m_metadata.contains(url))
+            continue;
+        Session* session = m_sessions.take(url);
+        if (!session)
+            continue;
+        session->stop();
+        session->deleteLater();
+    }
 }
 
 void RelayPool::setAuthSigner(const std::function<QByteArray(const QString&, const QString&)>& signer) {
@@ -216,7 +307,7 @@ void RelayPool::subscribe(const QString& id, const QJsonArray& filters) {
         const QString url = session->url();
         if (m_metadata.contains(url) && !isMetadataSub(id))
             continue;
-        if (m_outbox.contains(url) && id != QStringLiteral("following"))
+        if (m_outbox.contains(url) && id != QStringLiteral("following") && id != QStringLiteral("thread") && id != QStringLiteral("person") && id != QStringLiteral("graph"))
             continue;
         session->send(bytes);
     }
@@ -234,10 +325,12 @@ void RelayPool::unsubscribe(const QString& id) {
 int RelayPool::publish(const QByteArray& wireEvent) {
     const QByteArray message = "[\"EVENT\"," + wireEvent + "]";
     int sent = 0;
-    for (Session* session : m_sessions) {
-        if (!session->open())
+    for (auto it = m_sessions.cbegin(); it != m_sessions.cend(); ++it) {
+        if (m_metadata.contains(it.key()) || m_outbox.contains(it.key()))
             continue;
-        session->send(message);
+        if (!it.value()->open())
+            continue;
+        it.value()->send(message);
         ++sent;
     }
     return sent;
@@ -261,7 +354,7 @@ void RelayPool::sendSubscriptions(Session* session) {
     for (auto it = m_subs.cbegin(); it != m_subs.cend(); ++it) {
         if (metadata && !isMetadataSub(it.key()))
             continue;
-        if (outbox && it.key() != QStringLiteral("following"))
+        if (outbox && it.key() != QStringLiteral("following") && it.key() != QStringLiteral("thread") && it.key() != QStringLiteral("person") && it.key() != QStringLiteral("graph"))
             continue;
         session->send(it.value());
     }

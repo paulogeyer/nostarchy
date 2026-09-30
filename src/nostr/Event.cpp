@@ -21,7 +21,16 @@ QByteArray jsonEscape(const QString& text) {
         case '\n': out += "\\n"; break;
         case '\r': out += "\\r"; break;
         case '\t': out += "\\t"; break;
-        default: out += static_cast<char>(c); break;
+        default:
+            if (c < 0x20) {
+                out += "\\u00";
+                const char* hex = "0123456789abcdef";
+                out += hex[c >> 4];
+                out += hex[c & 0x0f];
+            } else {
+                out += static_cast<char>(c);
+            }
+            break;
         }
     }
     return out;
@@ -169,8 +178,7 @@ std::optional<NostrEvent> NostrEvent::fromJson(const QJsonObject& object) {
                 return std::nullopt;
             tag.append(item.toString());
         }
-        if (!tag.isEmpty())
-            event.tags.append(tag);
+        event.tags.append(tag);
     }
     if (event.kind < 0)
         return std::nullopt;

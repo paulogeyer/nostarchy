@@ -17,6 +17,7 @@ public:
     void setRelays(const QStringList& urls);
     void addMetadataRelay(const QString& url);
     void addOutboxRelay(const QString& url);
+    void clearOutbox();
     void setAuthSigner(const std::function<QByteArray(const QString& relay, const QString& challenge)>& signer);
     QByteArray authEvent(const QString& relay, const QString& challenge) const;
     QStringList relays() const;
@@ -35,6 +36,7 @@ signals:
 private:
     class Session;
     void sendSubscriptions(Session* session);
+    void retarget(Session* session, const QString& url);
 
     static bool isMetadataSub(const QString& id);
     QHash<QString, Session*> m_sessions;

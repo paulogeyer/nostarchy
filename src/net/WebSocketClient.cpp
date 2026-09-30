@@ -12,8 +12,13 @@ WebSocketClient::WebSocketClient(QObject* parent)
     });
     m_pingTimer.setInterval(25000);
     connect(&m_pingTimer, &QTimer::timeout, this, [this] {
-        if (m_state == State::Open)
-            sendFrame(0x9, QByteArray("n"));
+        if (m_state != State::Open)
+            return;
+        if (m_lastInbound.isValid() && m_lastInbound.elapsed() > 50000) {
+            fail(QStringLiteral("relay went quiet"));
+            return;
+        }
+        sendFrame(0x9, QByteArray("n"));
     });
 }
 
@@ -131,10 +136,49 @@ void WebSocketClient::onReadyRead() {
         m_buffer.remove(0, end + 4);
         const QList<QByteArray> lines = header.split('\n');
         if (lines.isEmpty() || !lines.first().contains(" 101 ")) {
-            const QString status = QString::fromLatin1(lines.value(0).trimmed());
+            const QByteArray statusLine = lines.value(0).trimmed();
+            const int space = statusLine.indexOf(' ');
+            const int code = space >= 0 ? statusLine.mid(space + 1, 3).toInt() : 0;
+            QString location;
+            for (int i = 1; i < lines.size(); ++i) {
+                const QByteArray line = lines.at(i).trimmed();
+                const int colon = line.indexOf(':');
+                if (colon < 0)
+                    continue;
+                if (QString::fromLatin1(line.left(colon)).trimmed().toLower() == QStringLiteral("location"))
+                    location = QString::fromLatin1(line.mid(colon + 1)).trimmed();
+            }
+            if (code >= 300 && code < 400 && !location.isEmpty() && m_redirects < 1) {
+                QUrl next(location);
+                if (next.isRelative())
+                    next = m_url.resolved(next);
+                const QString scheme = next.scheme().toLower();
+                if (scheme == QStringLiteral("https"))
+                    next.setScheme(QStringLiteral("wss"));
+                else if (scheme == QStringLiteral("http"))
+                    next.setScheme(QStringLiteral("ws"));
+                const QString relayScheme = next.scheme().toLower();
+                if ((relayScheme == QStringLiteral("wss") || relayScheme == QStringLiteral("ws")) && next.isValid()) {
+                    ++m_redirects;
+                    emit redirected(next);
+                    m_userClose = true;
+                    m_connectTimer.stop();
+                    m_pingTimer.stop();
+                    m_state = State::Idle;
+                    m_failed = false;
+                    if (m_socket)
+                        m_socket->abort();
+                    m_userClose = false;
+                    return;
+                }
+            }
+            const QString status = QString::fromLatin1(statusLine);
+            if ((code >= 300 && code < 400) || (code >= 400 && code < 500))
+                emit rejected(status.isEmpty() ? QStringLiteral("websocket upgrade failed") : status);
             fail(status.isEmpty() ? QStringLiteral("websocket upgrade failed") : status);
             return;
         }
+        m_redirects = 0;
         QString accept;
         for (int i = 1; i < lines.size(); ++i) {
             const QByteArray line = lines.at(i).trimmed();
@@ -153,6 +197,7 @@ void WebSocketClient::onReadyRead() {
         }
         m_state = State::Open;
         m_connectTimer.stop();
+        m_lastInbound.start();
         m_pingTimer.start();
         emit connected();
     }
@@ -276,6 +321,7 @@ bool WebSocketClient::tryParseFrame() {
 }
 
 void WebSocketClient::handleFrame(bool fin, int opcode, const QByteArray& payload) {
+    m_lastInbound.start();
     if (opcode == 0x9) {
         sendFrame(0xA, payload);
         return;
@@ -283,9 +329,14 @@ void WebSocketClient::handleFrame(bool fin, int opcode, const QByteArray& payloa
     if (opcode == 0xA)
         return;
     if (opcode == 0x8) {
+        m_state = State::Idle;
         sendFrame(0x8, QByteArray());
         if (m_socket)
             m_socket->disconnectFromHost();
+        return;
+    }
+    if (m_message.size() + payload.size() > 2 * 1024 * 1024) {
+        fail(QStringLiteral("message too large"));
         return;
     }
     if (opcode == 0x1 || opcode == 0x2) {

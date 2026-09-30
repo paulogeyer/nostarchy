@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ImageCache.h"
+#include "PeopleModel.h"
 #include "TimelineModel.h"
 #include "nostr/RelayPool.h"
 
@@ -40,6 +41,11 @@ class AppController : public QObject {
     Q_PROPERTY(QString profileAbout READ profileAbout NOTIFY profileChanged)
     Q_PROPERTY(QString profilePicture READ profilePicture NOTIFY profileChanged)
     Q_PROPERTY(QString profileNpub READ profileNpub NOTIFY profileChanged)
+    Q_PROPERTY(int profileFollowingCount READ profileFollowingCount NOTIFY profileChanged)
+    Q_PROPERTY(int profileFollowerCount READ profileFollowerCount NOTIFY profileChanged)
+    Q_PROPERTY(bool viewingPeople READ viewingPeople NOTIFY peopleChanged)
+    Q_PROPERTY(QString peopleTitle READ peopleTitle NOTIFY peopleChanged)
+    Q_PROPERTY(PeopleModel* people READ people CONSTANT)
     Q_PROPERTY(TimelineModel* profileNotes READ profileNotes CONSTANT)
     Q_PROPERTY(QString openNoteId READ openNoteId NOTIFY noteChanged)
     Q_PROPERTY(QString openNotePubkey READ openNotePubkey NOTIFY noteChanged)
@@ -47,6 +53,7 @@ class AppController : public QObject {
     Q_PROPERTY(QString openNoteContent READ openNoteContent NOTIFY noteChanged)
     Q_PROPERTY(QString openNoteTime READ openNoteTime NOTIFY noteChanged)
     Q_PROPERTY(TimelineModel* replies READ replies CONSTANT)
+    Q_PROPERTY(int avatarEpoch READ avatarEpoch NOTIFY avatarEpochChanged)
 
 public:
     explicit AppController(QObject* parent = nullptr);
@@ -83,6 +90,11 @@ public:
     QString profileAbout() const;
     QString profilePicture() const;
     QString profileNpub() const;
+    int profileFollowingCount() const;
+    int profileFollowerCount() const;
+    bool viewingPeople() const;
+    QString peopleTitle() const;
+    PeopleModel* people();
     TimelineModel* replies();
     TimelineModel* profileNotes();
 
@@ -99,9 +111,14 @@ public:
     Q_INVOKABLE void closeNote();
     Q_INVOKABLE void openProfile(const QString& pubkeyOrNpub);
     Q_INVOKABLE void closeProfile();
+    Q_INVOKABLE void showFollowing();
+    Q_INVOKABLE void showFollowers();
+    Q_INVOKABLE void closePeople();
     Q_INVOKABLE void openLink(const QString& link);
     Q_INVOKABLE void setRelaysFromText(const QString& text);
     Q_INVOKABLE void copyNpub();
+    Q_INVOKABLE QString avatarUrl(const QString& pubkey);
+    int avatarEpoch() const;
 
 signals:
     void identityChanged();
@@ -112,13 +129,22 @@ signals:
     void followsChanged();
     void noteChanged();
     void profileChanged();
+    void peopleChanged();
+    void avatarEpochChanged();
 
 private:
     struct Profile {
+        QString id;
         QString name;
         QString about;
         QString picture;
         qint64 createdAt = 0;
+    };
+    struct Social {
+        QStringList following;
+        QStringList followers;
+        qint64 followingAt = -1;
+        qint64 followersAt = 0;
     };
     struct Reply {
         QString id;
@@ -130,14 +156,18 @@ private:
     void persist();
     void load();
     void loadCache();
+    bool loadFollowingCache();
     void saveCache();
+    void saveFollowingCache();
     void scheduleSave();
     void rememberNote(const NostrEvent& event);
+    void trimNoteCache();
     void refillTimeline();
     void connectDefault();
     void subscribeAll();
     void subscribeFeed();
     void subscribeRelayLists();
+    void rebuildOutbox();
     void subscribeProfiles();
     void noteAuthor(const QString& pubkey);
     void indexPeople(const NostrEvent& event);
@@ -147,6 +177,8 @@ private:
     void handleEvent(const QString& relay, const QString& subId, const QJsonObject& object);
     void handleProfile(const NostrEvent& event);
     void handleContacts(const NostrEvent& event);
+    void rememberSocial(const NostrEvent& event);
+    void applySocial(const QString& pubkey);
     void publishContacts();
     bool publishEvent(NostrEvent event);
     QString nameFor(const QString& pubkey) const;
@@ -158,6 +190,7 @@ private:
     TimelineModel m_timeline;
     TimelineModel m_replies{nullptr, false};
     TimelineModel m_profileNotes;
+    PeopleModel m_people;
     QTimer m_profileTimer;
     QTimer m_clock;
     std::optional<Keys> m_keys;
@@ -169,10 +202,20 @@ private:
     QHash<QString, QString> m_relayDetail;
     QSet<QString> m_follows;
     QSet<QString> m_pendingProfiles;
+    QSet<QString> m_profileAsked;
+    QSet<QString> m_seenEventIds;
+    QHash<QString, QStringList> m_writeRelays;
+    QHash<QString, qint64> m_relayListAt;
+    QHash<QString, QString> m_relayListId;
+    QVector<QStringList> m_lastContactTags;
     QTimer m_mentionTimer;
     QTimer m_saveTimer;
     QHash<QString, NostrEvent> m_noteCache;
     qint64 m_contactsAt = -1;
+    QString m_contactsId;
+    qint64 m_pendingContactAt = -1;
+    QString m_pendingContactId;
+    bool m_profilesInFlight = false;
     int m_feedMode = 0;
     std::optional<Reply> m_reply;
     QString m_openId;
@@ -184,4 +227,10 @@ private:
     QHash<QString, QVector<QStringList>> m_noteTags;
     bool m_viewingProfile = false;
     QString m_profilePubkey;
+    QHash<QString, Social> m_social;
+    QStringList m_profileFollowing;
+    QStringList m_profileFollowers;
+    bool m_viewingPeople = false;
+    int m_peopleMode = 0;
+    int m_avatarEpoch = 0;
 };

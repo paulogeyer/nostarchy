@@ -45,6 +45,12 @@ set(NOSTARCHY_SOURCES
     src/AppController.h
     src/ImageCache.cpp
     src/ImageCache.h
+    src/PeopleModel.cpp
+    src/PeopleModel.h
+    src/Theme.cpp
+    src/Theme.h
+    src/LogStore.cpp
+    src/LogStore.h
 )
 
 add_library(nostarchy_core STATIC ${NOSTARCHY_SOURCES})

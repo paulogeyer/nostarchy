@@ -5,6 +5,7 @@
 #include <QSslSocket>
 #include <QTimer>
 #include <QUrl>
+#include <QElapsedTimer>
 
 class WebSocketClient : public QObject {
     Q_OBJECT
@@ -22,6 +23,8 @@ signals:
     void disconnected();
     void textMessageReceived(const QString& message);
     void errorOccurred(const QString& message);
+    void redirected(const QUrl& url);
+    void rejected(const QString& message);
 
 private:
     void startHandshake();
@@ -36,6 +39,7 @@ private:
     QSslSocket* m_socket = nullptr;
     QTimer m_connectTimer;
     QTimer m_pingTimer;
+    QElapsedTimer m_lastInbound;
     QUrl m_url;
     QByteArray m_acceptKey;
     QByteArray m_buffer;
@@ -44,6 +48,7 @@ private:
     QByteArray m_payload;
     bool m_tls = true;
     bool m_userClose = false;
+    int m_redirects = 0;
     bool m_failed = false;
     bool m_fin = false;
     bool m_masked = false;
