@@ -99,6 +99,15 @@ void TimelineModel::upsert(const NostrEvent& event, const QString& name, const Q
     }
 }
 
+void TimelineModel::remove(const QString& eventId) {
+    const int row = indexOf(eventId);
+    if (row < 0)
+        return;
+    beginRemoveRows(QModelIndex(), row, row);
+    m_notes.removeAt(row);
+    endRemoveRows();
+}
+
 void TimelineModel::setAuthor(const QString& pubkey, const QString& name, const QString& picture) {
     for (int i = 0; i < m_notes.size(); ++i) {
         if (m_notes.at(i).pubkey != pubkey)

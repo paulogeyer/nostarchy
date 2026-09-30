@@ -101,6 +101,7 @@ public:
     Q_INVOKABLE void generateIdentity();
     Q_INVOKABLE void importSecret(const QString& text);
     Q_INVOKABLE void publishNote(const QString& text);
+    Q_INVOKABLE void deleteNote(const QString& eventId);
     Q_INVOKABLE void publishProfile(const QString& name, const QString& about);
     Q_INVOKABLE void beginReply(const QString& eventId, const QString& pubkey, const QString& name);
     Q_INVOKABLE void cancelReply();
@@ -180,6 +181,7 @@ private:
     void rememberSocial(const NostrEvent& event);
     void applySocial(const QString& pubkey);
     void publishContacts();
+    void forgetNote(const QString& eventId);
     bool publishEvent(NostrEvent event);
     QString nameFor(const QString& pubkey) const;
     void setStatus(const QString& text);
@@ -204,6 +206,8 @@ private:
     QSet<QString> m_pendingProfiles;
     QSet<QString> m_profileAsked;
     QSet<QString> m_seenEventIds;
+    QSet<QString> m_deletedIds;
+    QHash<QString, QString> m_deletionAuthors;
     QHash<QString, QStringList> m_writeRelays;
     QHash<QString, qint64> m_relayListAt;
     QHash<QString, QString> m_relayListId;

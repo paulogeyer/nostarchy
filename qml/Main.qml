@@ -477,187 +477,194 @@ component RichNote: Text {
                 border.color: theme.border
                 clip: true
 
-                ColumnLayout {
+                Flickable {
+                    id: profilePage
                     anchors.fill: parent
                     anchors.margins: 8
                     visible: app.viewingProfile
-                    spacing: 8
-                    RowLayout {
-                        Layout.fillWidth: true
-                        QuietButton { text: "Back"; onClicked: app.closeProfile() }
-                        Avatar { picture: app.profilePicture; label: app.profileName; box: 48 }
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            Text {
-                                text: app.profileName
-                                color: theme.text
-                                font.pixelSize: 16
-                                font.bold: true
-                                elide: Text.ElideRight
+                    contentWidth: width
+                    contentHeight: profileColumn.implicitHeight
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    FastWheel {}
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    property string shownPubkey: app.profilePubkey
+                    onShownPubkeyChanged: contentY = 0
+
+                    Column {
+                        id: profileColumn
+                        width: profilePage.width
+                        spacing: 8
+                        RowLayout {
+                            width: parent.width
+                            QuietButton { text: "Back"; onClicked: app.closeProfile() }
+                            Avatar { picture: app.profilePicture; label: app.profileName; box: 48 }
+                            ColumnLayout {
                                 Layout.fillWidth: true
-                            }
-                            Text {
-                                text: app.profileNpub
-                                color: theme.faint
-                                font.pixelSize: 11
-                                            elide: Text.ElideRight
-                                Layout.fillWidth: true
-                            }
-                        }
-                    }
-                    RichNote {
-                        body: app.profileAbout
-                        visible: app.profileAbout.length > 0
-                        Layout.fillWidth: true
-                    }
-                    QuietButton {
-                        visible: app.profilePubkey !== app.pubkey
-                        text: app.followCount >= 0 && app.isFollowed(app.profilePubkey) ? "Following" : "Follow"
-                        onClicked: app.toggleFollow(app.profilePubkey)
-                    }
-                    Row {
-                        spacing: 16
-                        Text {
-                            text: "Timeline"
-                            color: !app.viewingPeople ? theme.accent : theme.muted
-                            font.pixelSize: 13
-                            font.bold: !app.viewingPeople
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: app.closePeople()
-                            }
-                        }
-                        Text {
-                            text: app.profileFollowingCount + " following"
-                            color: app.viewingPeople && app.peopleTitle === "Following" ? theme.accent : theme.muted
-                            font.pixelSize: 13
-                            font.bold: app.viewingPeople && app.peopleTitle === "Following"
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: app.showFollowing()
-                            }
-                        }
-                        Text {
-                            text: app.profileFollowerCount + " followers"
-                            color: app.viewingPeople && app.peopleTitle === "Followers" ? theme.accent : theme.muted
-                            font.pixelSize: 13
-                            font.bold: app.viewingPeople && app.peopleTitle === "Followers"
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: app.showFollowers()
-                            }
-                        }
-                    }
-                    RowLayout {
-                        visible: app.viewingPeople
-                        Layout.fillWidth: true
-                        QuietButton { text: "Back"; onClicked: app.closePeople() }
-                        Text {
-                            text: app.peopleTitle
-                            color: theme.text
-                            font.pixelSize: 14
-                            font.bold: true
-                        }
-                    }
-                    ListView {
-                        visible: app.viewingPeople
-                        Layout.fillWidth: true
-                        Layout.fillHeight: app.viewingPeople
-                        FastWheel {}
-                        model: app.people
-                        clip: true
-                        spacing: 6
-                        boundsBehavior: Flickable.StopAtBounds
-                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                        delegate: Rectangle {
-                            required property string pubkey
-                            required property string name
-                            required property string picture
-                            width: ListView.view.width
-                            height: 44
-                            radius: 8
-                            color: theme.card
-                            RowLayout {
-                                anchors.fill: parent
-                                anchors.margins: 8
-                                spacing: 8
-                                Avatar { picture: face(pubkey); label: name; box: 28 }
                                 Text {
-                                    text: name
-                                    color: theme.accent
-                                    font.pixelSize: 13
+                                    text: app.profileName
+                                    color: theme.text
+                                    font.pixelSize: 16
+                                    font.bold: true
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                                Text {
+                                    text: app.profileNpub
+                                    color: theme.faint
+                                    font.pixelSize: 11
                                     elide: Text.ElideRight
                                     Layout.fillWidth: true
                                 }
                             }
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: app.openProfile(pubkey)
+                        }
+                        RichNote {
+                            body: app.profileAbout
+                            visible: app.profileAbout.length > 0
+                        }
+                        QuietButton {
+                            visible: app.profilePubkey !== app.pubkey
+                            text: app.followCount >= 0 && app.isFollowed(app.profilePubkey) ? "Following" : "Follow"
+                            onClicked: app.toggleFollow(app.profilePubkey)
+                        }
+                        Row {
+                            spacing: 16
+                            Text {
+                                text: "Timeline"
+                                color: !app.viewingPeople ? theme.accent : theme.muted
+                                font.pixelSize: 13
+                                font.bold: !app.viewingPeople
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: app.closePeople()
+                                }
+                            }
+                            Text {
+                                text: app.profileFollowingCount + " following"
+                                color: app.viewingPeople && app.peopleTitle === "Following" ? theme.accent : theme.muted
+                                font.pixelSize: 13
+                                font.bold: app.viewingPeople && app.peopleTitle === "Following"
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: app.showFollowing()
+                                }
+                            }
+                            Text {
+                                text: app.profileFollowerCount + " followers"
+                                color: app.viewingPeople && app.peopleTitle === "Followers" ? theme.accent : theme.muted
+                                font.pixelSize: 13
+                                font.bold: app.viewingPeople && app.peopleTitle === "Followers"
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: app.showFollowers()
+                                }
                             }
                         }
-                    }
-                    Text {
-                        visible: !app.viewingPeople
-                        text: "NOTES"
-                        color: theme.faint
-                        font.pixelSize: 11
-                    }
-                    ListView {
-                        id: profileView
-                        FastWheel {}
-                        visible: !app.viewingPeople
-                        Layout.fillWidth: true
-                        Layout.fillHeight: !app.viewingPeople
-                        spacing: 8
-                        clip: true
-                        model: app.profileNotes
-                        boundsBehavior: Flickable.StopAtBounds
-                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                        delegate: Rectangle {
-                            required property string eventId
-                            required property string pubkey
-                            required property string name
-                            required property string content
-                            required property string richContent
-                            required property string timeText
-                            required property string picture
-                            width: profileView.width
-                            implicitHeight: personCol.implicitHeight + 16
-                            height: implicitHeight
-                            radius: 8
-                            color: theme.card
-                            Column {
-                                id: personCol
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.top: parent.top
-                                anchors.margins: 10
-                                spacing: 4
+                        RowLayout {
+                            visible: app.viewingPeople
+                            width: parent.width
+                            QuietButton { text: "Back"; onClicked: app.closePeople() }
+                            Text {
+                                text: app.peopleTitle
+                                color: theme.text
+                                font.pixelSize: 14
+                                font.bold: true
+                            }
+                        }
+                        ListView {
+                            visible: app.viewingPeople
+                            width: parent.width
+                            height: contentHeight
+                            interactive: false
+                            model: app.people
+                            spacing: 6
+                            delegate: Rectangle {
+                                required property string pubkey
+                                required property string name
+                                required property string picture
+                                width: ListView.view.width
+                                height: 44
+                                radius: 8
+                                color: theme.card
                                 RowLayout {
-                                    width: parent.width
-                                    Avatar { picture: face(pubkey); label: name; box: 24 }
+                                    anchors.fill: parent
+                                    anchors.margins: 8
+                                    spacing: 8
+                                    Avatar { picture: face(pubkey); label: name; box: 28 }
                                     Text {
                                         text: name
                                         color: theme.accent
                                         font.pixelSize: 13
-                                        font.bold: true
                                         elide: Text.ElideRight
                                         Layout.fillWidth: true
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: app.openProfile(pubkey)
-                                        }
                                     }
-                                    Text { text: timeText; color: theme.faint; font.pixelSize: 11 }
                                 }
-                                RichNote { body: richContent }
-                                QuietButton {
-                                    text: "View"
-                                    onClicked: app.openNote(eventId, pubkey, name, content, timeText)
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: app.openProfile(pubkey)
+                                }
+                            }
+                        }
+                        Text {
+                            visible: !app.viewingPeople
+                            text: "NOTES"
+                            color: theme.faint
+                            font.pixelSize: 11
+                        }
+                        ListView {
+                            id: profileView
+                            visible: !app.viewingPeople
+                            width: parent.width
+                            height: contentHeight
+                            interactive: false
+                            spacing: 8
+                            model: app.profileNotes
+                            delegate: Rectangle {
+                                required property string eventId
+                                required property string pubkey
+                                required property string name
+                                required property string content
+                                required property string richContent
+                                required property string timeText
+                                required property string picture
+                                width: profileView.width
+                                implicitHeight: personCol.implicitHeight + 16
+                                height: implicitHeight
+                                radius: 8
+                                color: theme.card
+                                Column {
+                                    id: personCol
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    anchors.margins: 10
+                                    spacing: 4
+                                    RowLayout {
+                                        width: parent.width
+                                        Avatar { picture: face(pubkey); label: name; box: 24 }
+                                        Text {
+                                            text: name
+                                            color: theme.accent
+                                            font.pixelSize: 13
+                                            font.bold: true
+                                            elide: Text.ElideRight
+                                            Layout.fillWidth: true
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: app.openProfile(pubkey)
+                                            }
+                                        }
+                                        Text { text: timeText; color: theme.faint; font.pixelSize: 11 }
+                                    }
+                                    RichNote { body: richContent }
+                                    QuietButton {
+                                        text: "View"
+                                        onClicked: app.openNote(eventId, pubkey, name, content, timeText)
+                                    }
                                 }
                             }
                         }
@@ -717,6 +724,11 @@ component RichNote: Text {
                         QuietButton {
                             text: "Reply"
                             onClicked: app.beginReply(app.openNoteId, app.openNotePubkey, app.openNoteName)
+                        }
+                        QuietButton {
+                            visible: app.openNotePubkey === app.pubkey
+                            text: "Delete"
+                            onClicked: deleteDialog.open()
                         }
                         QuietButton {
                             visible: app.openNotePubkey !== app.pubkey
@@ -896,6 +908,45 @@ component RichNote: Text {
             return
         app.publishNote(composer.text)
         composer.clear()
+    }
+
+    Dialog {
+        id: deleteDialog
+        title: "Delete note"
+        modal: true
+        anchors.centerIn: parent
+        width: 360
+        standardButtons: Dialog.NoButton
+        background: Rectangle { color: theme.surface; radius: 12; border.color: theme.border }
+        header: Label {
+            text: "Delete note"
+            color: theme.text
+            font.pixelSize: 16
+            leftPadding: 16
+            topPadding: 14
+        }
+        contentItem: Column {
+            spacing: 12
+            width: 320
+            Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: "Ask relays to delete this note. Some may keep a copy."
+                color: theme.muted
+                font.pixelSize: 13
+            }
+            Row {
+                spacing: 8
+                QuietButton {
+                    text: "Delete"
+                    onClicked: {
+                        app.deleteNote(app.openNoteId)
+                        deleteDialog.close()
+                    }
+                }
+                QuietButton { text: "Cancel"; onClicked: deleteDialog.close() }
+            }
+        }
     }
 
     Dialog {

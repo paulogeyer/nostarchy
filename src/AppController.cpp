@@ -320,6 +320,28 @@ void AppController::publishNote(const QString& text) {
     cancelReply();
 }
 
+void AppController::deleteNote(const QString& eventId) {
+    if (!m_keys || eventId.size() != 64)
+        return;
+    QString author;
+    if (m_noteCache.contains(eventId))
+        author = m_noteCache.value(eventId).pubkey;
+    else if (m_openId == eventId)
+        author = m_openPubkey;
+    if (author != m_keys->pubkeyHex()) {
+        setStatus(QStringLiteral("can only delete your own notes"));
+        return;
+    }
+    NostrEvent event;
+    event.kind = 5;
+    event.createdAt = QDateTime::currentSecsSinceEpoch();
+    event.tags.append({QStringLiteral("e"), eventId});
+    if (!publishEvent(event))
+        return;
+    forgetNote(eventId);
+    setStatus(QStringLiteral("deletion requested"));
+}
+
 void AppController::publishProfile(const QString& name, const QString& about) {
     if (!m_keys)
         return;
@@ -800,6 +822,8 @@ void AppController::handleEvent(const QString&, const QString& subId, const QJso
     auto event = NostrEvent::fromJson(object);
     if (!event)
         return;
+    if (m_deletedIds.contains(event->id))
+        return;
     if (m_seenEventIds.contains(event->id))
         return;
     if (m_seenEventIds.size() > 4000)
@@ -833,6 +857,22 @@ void AppController::handleEvent(const QString&, const QString& subId, const QJso
         rebuildOutbox();
         return;
     }
+    if (event->kind == 5) {
+        for (const QStringList& tag : event->tags) {
+            if (tag.size() < 2 || tag.at(0) != QStringLiteral("e") || tag.at(1).size() != 64)
+                continue;
+            const QString id = tag.at(1).toLower();
+            const QString author = m_noteCache.contains(id) ? m_noteCache.value(id).pubkey : m_deletionAuthors.value(id);
+            if (!author.isEmpty() && author != event->pubkey)
+                continue;
+            if (author.isEmpty())
+                m_deletionAuthors.insert(id, event->pubkey);
+            else
+                forgetNote(id);
+        }
+        scheduleSave();
+        return;
+    }
     if (event->kind == 3) {
         if (m_keys && event->pubkey == m_keys->pubkeyHex())
             handleContacts(*event);
@@ -841,6 +881,10 @@ void AppController::handleEvent(const QString&, const QString& subId, const QJso
     }
     if (event->kind != 1)
         return;
+    if (m_deletionAuthors.value(event->id) == event->pubkey) {
+        forgetNote(event->id);
+        return;
+    }
     rememberNote(*event);
     m_noteTags.insert(event->id, event->tags);
     indexPeople(*event);
@@ -861,11 +905,10 @@ void AppController::handleEvent(const QString&, const QString& subId, const QJso
         m_replies.upsert(*event, name, picture);
     if (subId == QStringLiteral("thread"))
         return;
-    if (subId == QStringLiteral("person")) {
-        if (event->pubkey == m_profilePubkey)
-            m_profileNotes.upsert(*event, name, picture);
+    if (m_viewingProfile && event->pubkey == m_profilePubkey)
+        m_profileNotes.upsert(*event, name, picture);
+    if (subId == QStringLiteral("person"))
         return;
-    }
     if (m_feedMode == 1 && !m_follows.isEmpty() && m_keys && event->pubkey != m_keys->pubkeyHex() && !m_follows.contains(event->pubkey))
         return;
     m_timeline.upsert(*event, name, picture);
@@ -976,6 +1019,21 @@ void AppController::publishContacts() {
     scheduleSave();
 }
 
+void AppController::forgetNote(const QString& eventId) {
+    if (eventId.size() != 64)
+        return;
+    m_deletedIds.insert(eventId);
+    m_deletionAuthors.remove(eventId);
+    m_noteCache.remove(eventId);
+    m_noteTags.remove(eventId);
+    m_timeline.remove(eventId);
+    m_profileNotes.remove(eventId);
+    m_replies.remove(eventId);
+    if (m_openId == eventId)
+        closeNote();
+    scheduleSave();
+}
+
 bool AppController::publishEvent(NostrEvent event) {
     if (!m_keys || !event.sign(*m_keys)) {
         setStatus(QStringLiteral("could not sign event"));
@@ -987,6 +1045,8 @@ bool AppController::publishEvent(NostrEvent event) {
         const QString name = nameFor(event.pubkey);
         const QString picture = pictureFor(event.pubkey);
         m_timeline.upsert(event, name, picture);
+        if (m_viewingProfile && event.pubkey == m_profilePubkey)
+            m_profileNotes.upsert(event, name, picture);
         if (!m_openId.isEmpty() && repliesTo(event, m_openId))
             m_replies.upsert(event, name, picture);
     }
@@ -1205,6 +1265,11 @@ bool AppController::loadFollowingCache() {
     const QString owner = root.value(QStringLiteral("owner")).toString();
     if (m_keys && !owner.isEmpty() && owner != m_keys->pubkeyHex())
         return false;
+    for (const QJsonValue& item : root.value(QStringLiteral("deleted")).toArray()) {
+        const QString id = item.toString().toLower();
+        if (id.size() == 64)
+            m_deletedIds.insert(id);
+    }
     const QJsonObject profiles = root.value(QStringLiteral("profiles")).toObject();
     for (auto it = profiles.begin(); it != profiles.end(); ++it) {
         if (it.key().size() != 64)
@@ -1221,6 +1286,8 @@ bool AppController::loadFollowingCache() {
     for (const QJsonValue& item : root.value(QStringLiteral("notes")).toArray()) {
         auto event = NostrEvent::fromJson(item.toObject());
         if (!event || event->kind != 1 || event->id.size() != 64)
+            continue;
+        if (m_deletedIds.contains(event->id))
             continue;
         m_noteCache.insert(event->id, *event);
         ++loaded;
@@ -1260,6 +1327,10 @@ void AppController::saveFollowingCache() {
         root.insert(QStringLiteral("owner"), m_keys->pubkeyHex());
     root.insert(QStringLiteral("notes"), noteArray);
     root.insert(QStringLiteral("profiles"), profiles);
+    QJsonArray deleted;
+    for (const QString& id : m_deletedIds)
+        deleted.append(id);
+    root.insert(QStringLiteral("deleted"), deleted);
     const QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
     QDir().mkpath(dir);
     QSaveFile file(dir + QStringLiteral("/following.json"));
@@ -1278,6 +1349,11 @@ void AppController::loadCache() {
     const QString owner = root.value(QStringLiteral("owner")).toString();
     if (m_keys && !owner.isEmpty() && owner != m_keys->pubkeyHex())
         return;
+    for (const QJsonValue& item : root.value(QStringLiteral("deleted")).toArray()) {
+        const QString id = item.toString().toLower();
+        if (id.size() == 64)
+            forgetNote(id);
+    }
     const QJsonObject profiles = root.value(QStringLiteral("profiles")).toObject();
     for (auto it = profiles.begin(); it != profiles.end(); ++it) {
         if (it.key().size() != 64)
@@ -1327,7 +1403,7 @@ void AppController::loadCache() {
     }
     for (const QJsonValue& item : root.value(QStringLiteral("notes")).toArray()) {
         auto event = NostrEvent::fromJson(item.toObject());
-        if (event && event->kind == 1 && event->id.size() == 64)
+        if (event && event->kind == 1 && event->id.size() == 64 && !m_deletedIds.contains(event->id))
             m_noteCache.insert(event->id, *event);
     }
 }
@@ -1393,6 +1469,10 @@ void AppController::saveCache() {
     root.insert(QStringLiteral("follows"), follows);
     root.insert(QStringLiteral("social"), social);
     root.insert(QStringLiteral("contactsAt"), m_contactsAt);
+    QJsonArray deleted;
+    for (const QString& id : m_deletedIds)
+        deleted.append(id);
+    root.insert(QStringLiteral("deleted"), deleted);
     const QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
     QDir().mkpath(dir);
     QSaveFile file(dir + QStringLiteral("/feed.json"));

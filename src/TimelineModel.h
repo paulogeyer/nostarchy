@@ -29,6 +29,7 @@ public:
     QHash<int, QByteArray> roleNames() const override;
 
     void upsert(const NostrEvent& event, const QString& name, const QString& picture = {});
+    void remove(const QString& eventId);
     void setAuthor(const QString& pubkey, const QString& name, const QString& picture);
     void setFollows(const QSet<QString>& follows);
     void clear();
