@@ -74,7 +74,7 @@ void ImageCache::pump() {
     while (m_active < kMaxActive && !m_queue.isEmpty()) {
         const QString url = m_queue.dequeue();
         QNetworkRequest request{QUrl(url)};
-        request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("Mozilla/5.0 nostarchy/0.1"));
+        request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("Mozilla/5.0 nostarchy/0.3"));
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
         request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
         request.setTransferTimeout(12000);

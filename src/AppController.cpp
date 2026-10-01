@@ -17,7 +17,13 @@
 #include <QSaveFile>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QCryptographicHash>
+#include <QFileInfo>
+#include <QMimeDatabase>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QUrl>
+#include <QUrlQuery>
 #include <QtLogging>
 
 namespace {
@@ -128,6 +134,8 @@ AppController::AppController(QObject* parent)
     connect(&m_mentionTimer, &QTimer::timeout, this, [this] {
         m_timeline.refreshMentions();
         m_replies.refreshMentions();
+        m_inbox.refreshMentions();
+        m_hashtagNotes.refreshMentions();
         m_profileNotes.refreshMentions();
     });
     m_saveTimer.setSingleShot(true);
@@ -135,20 +143,28 @@ AppController::AppController(QObject* parent)
     connect(&m_saveTimer, &QTimer::timeout, this, &AppController::saveCache);
     m_clock.setInterval(30000);
     m_replies.setParent(this);
+    m_inbox.setParent(this);
+    m_hashtagNotes.setParent(this);
     m_profileNotes.setParent(this);
     const auto formatter = [this](const QString& content, const QVector<QStringList>& tags) {
         return renderNote(content, tags);
     };
     m_timeline.setFormatter(formatter);
     m_replies.setFormatter(formatter);
+    m_inbox.setFormatter(formatter);
+    m_hashtagNotes.setFormatter(formatter);
     m_profileNotes.setFormatter(formatter);
     const auto images = [this](const QString& url) { return m_images.lookup(url); };
     m_timeline.setImageLookup(images);
     m_replies.setImageLookup(images);
+    m_inbox.setImageLookup(images);
+    m_hashtagNotes.setImageLookup(images);
     m_profileNotes.setImageLookup(images);
     const auto pictures = [this](const QString& pubkey) { return pictureFor(pubkey); };
     m_timeline.setPictureLookup(pictures);
     m_replies.setPictureLookup(pictures);
+    m_inbox.setPictureLookup(pictures);
+    m_hashtagNotes.setPictureLookup(pictures);
     m_profileNotes.setPictureLookup(pictures);
     m_people.setParent(this);
     m_people.setNameLookup([this](const QString& pubkey) { return nameFor(pubkey); });
@@ -156,6 +172,8 @@ AppController::AppController(QObject* parent)
     connect(&m_images, &ImageCache::ready, this, [this](const QString& url) {
         m_timeline.refreshPicture(url);
         m_replies.refreshPicture(url);
+        m_inbox.refreshPicture(url);
+        m_hashtagNotes.refreshPicture(url);
         m_profileNotes.refreshPicture(url);
         if (m_keys && pictureFor(m_keys->pubkeyHex()) == url)
             emit identityChanged();
@@ -168,6 +186,8 @@ AppController::AppController(QObject* parent)
     });
     connect(&m_clock, &QTimer::timeout, &m_timeline, &TimelineModel::refreshTimes);
     connect(&m_clock, &QTimer::timeout, &m_replies, &TimelineModel::refreshTimes);
+    connect(&m_clock, &QTimer::timeout, &m_inbox, &TimelineModel::refreshTimes);
+    connect(&m_clock, &QTimer::timeout, &m_hashtagNotes, &TimelineModel::refreshTimes);
     connect(&m_clock, &QTimer::timeout, &m_profileNotes, &TimelineModel::refreshTimes);
     m_clock.start();
     m_pool.addMetadataRelay(QStringLiteral("wss://purplepag.es/"));
@@ -221,6 +241,18 @@ QString AppController::profilePicture() const { return m_images.lookup(pictureFo
 
 int AppController::avatarEpoch() const { return m_avatarEpoch; }
 
+TimelineModel* AppController::inbox() { return &m_inbox; }
+TimelineModel* AppController::hashtagNotes() { return &m_hashtagNotes; }
+bool AppController::viewingHashtag() const { return m_viewingHashtag; }
+QString AppController::hashtag() const { return m_hashtag; }
+bool AppController::quoting() const { return m_quote.has_value(); }
+QString AppController::quoteLabel() const { return m_quote ? m_quote->name : QString(); }
+QString AppController::profileNip05() const { return m_profiles.value(m_profilePubkey).nip05; }
+bool AppController::profileNip05Ok() const { return m_profiles.value(m_profilePubkey).nip05Ok; }
+int AppController::reactionEpoch() const { return m_reactionEpoch; }
+int AppController::reactionCount(const QString& eventId) const { return m_reactionCounts.value(eventId); }
+bool AppController::isMuted(const QString& pubkey) const { return m_muted.contains(pubkey.toLower()); }
+
 QString AppController::avatarUrl(const QString& pubkey) {
     const QString remote = pictureFor(pubkey);
     const QString local = m_images.lookup(remote);
@@ -263,7 +295,7 @@ QString AppController::relayText() const {
 void AppController::setFeedMode(int mode) {
     if (mode == m_feedMode)
         return;
-    m_feedMode = mode == 1 ? 1 : 0;
+    m_feedMode = mode == 1 ? 1 : mode == 2 ? 2 : 0;
     refillTimeline();
     subscribeFeed();
     persist();
@@ -315,9 +347,15 @@ void AppController::publishNote(const QString& text) {
         event.tags.append({QStringLiteral("e"), m_reply->id, QString(), QStringLiteral("reply")});
         event.tags.append({QStringLiteral("p"), m_reply->pubkey});
     }
+    if (m_quote) {
+        event.tags.append({QStringLiteral("q"), m_quote->id, QString(), m_quote->pubkey});
+        event.tags.append({QStringLiteral("e"), m_quote->id, QString(), QStringLiteral("mention")});
+        event.tags.append({QStringLiteral("p"), m_quote->pubkey});
+    }
     if (!publishEvent(event))
         return;
     cancelReply();
+    cancelQuote();
 }
 
 void AppController::deleteNote(const QString& eventId) {
@@ -340,6 +378,155 @@ void AppController::deleteNote(const QString& eventId) {
         return;
     forgetNote(eventId);
     setStatus(QStringLiteral("deletion requested"));
+}
+
+void AppController::react(const QString& eventId, const QString& pubkey) {
+    if (!m_keys || eventId.size() != 64 || m_reacted.contains(eventId))
+        return;
+    NostrEvent event;
+    event.kind = 7;
+    event.createdAt = QDateTime::currentSecsSinceEpoch();
+    event.content = QStringLiteral("+");
+    event.tags.append({QStringLiteral("e"), eventId});
+    if (pubkey.size() == 64)
+        event.tags.append({QStringLiteral("p"), pubkey.toLower()});
+    if (!publishEvent(event))
+        return;
+    m_reacted.insert(eventId);
+    ++m_reactionCounts[eventId];
+    ++m_reactionEpoch;
+    emit reactionEpochChanged();
+}
+
+void AppController::repost(const QString& eventId, const QString& pubkey) {
+    if (!m_keys || eventId.size() != 64)
+        return;
+    NostrEvent event;
+    event.kind = 6;
+    event.createdAt = QDateTime::currentSecsSinceEpoch();
+    event.tags.append({QStringLiteral("e"), eventId});
+    if (pubkey.size() == 64)
+        event.tags.append({QStringLiteral("p"), pubkey.toLower()});
+    if (m_noteCache.contains(eventId))
+        event.content = QString::fromUtf8(m_noteCache.value(eventId).toWire());
+    if (!publishEvent(event))
+        return;
+    setStatus(QStringLiteral("reposted"));
+}
+
+void AppController::beginQuote(const QString& eventId, const QString& pubkey, const QString& name) {
+    m_quote = Reply{eventId, pubkey.toLower(), name};
+    emit quoteChanged();
+}
+
+void AppController::cancelQuote() {
+    if (!m_quote)
+        return;
+    m_quote.reset();
+    emit quoteChanged();
+}
+
+void AppController::copyNote(const QString& eventId) {
+    const auto raw = fromHex(eventId);
+    if (!raw || raw->size() != 32)
+        return;
+    const auto text = bech32::encode(QStringLiteral("note"), *raw);
+    if (!text)
+        return;
+    QGuiApplication::clipboard()->setText(*text);
+    setStatus(QStringLiteral("note id copied"));
+}
+
+void AppController::mutePubkey(const QString& pubkey) {
+    const QString hex = pubkey.toLower();
+    if (hex.size() != 64 || m_muted.contains(hex))
+        return;
+    m_muted.insert(hex);
+    m_timeline.removeAuthor(hex);
+    m_inbox.removeAuthor(hex);
+    m_hashtagNotes.removeAuthor(hex);
+    publishMuteList();
+    persist();
+    setStatus(QStringLiteral("muted"));
+}
+
+void AppController::unmutePubkey(const QString& pubkey) {
+    if (!m_muted.remove(pubkey.toLower()))
+        return;
+    publishMuteList();
+    persist();
+    refillTimeline();
+    setStatus(QStringLiteral("unmuted"));
+}
+
+void AppController::openHashtag(const QString& tag) {
+    QString clean = tag.trimmed().toLower();
+    if (clean.startsWith(QLatin1Char('#')))
+        clean = clean.mid(1);
+    if (clean.isEmpty())
+        return;
+    m_hashtag = clean;
+    m_viewingHashtag = true;
+    m_hashtagNotes.clear();
+    emit hashtagChanged();
+    QJsonObject filter;
+    filter.insert(QStringLiteral("kinds"), QJsonArray{1});
+    filter.insert(QStringLiteral("#t"), QJsonArray{clean});
+    filter.insert(QStringLiteral("limit"), 40);
+    m_pool.subscribe(QStringLiteral("hashtag"), QJsonArray{filter});
+}
+
+void AppController::closeHashtag() {
+    if (!m_viewingHashtag)
+        return;
+    m_viewingHashtag = false;
+    m_hashtag.clear();
+    m_hashtagNotes.clear();
+    m_pool.unsubscribe(QStringLiteral("hashtag"));
+    emit hashtagChanged();
+}
+
+void AppController::uploadImage(const QString& path) {
+    if (!m_keys)
+        return;
+    const QString local = QUrl(path).isLocalFile() ? QUrl(path).toLocalFile() : path;
+    QFile file(local);
+    if (!file.open(QIODevice::ReadOnly)) {
+        setStatus(QStringLiteral("could not read image"));
+        return;
+    }
+    const QByteArray bytes = file.readAll();
+    if (bytes.size() < 32 || bytes.size() > 5 * 1024 * 1024) {
+        setStatus(QStringLiteral("image must be under 5 MB"));
+        return;
+    }
+    const QString hash = QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+    NostrEvent auth;
+    auth.kind = 24242;
+    auth.createdAt = QDateTime::currentSecsSinceEpoch();
+    auth.tags.append({QStringLiteral("t"), QStringLiteral("upload")});
+    auth.tags.append({QStringLiteral("x"), hash});
+    auth.tags.append({QStringLiteral("expiration"), QString::number(auth.createdAt + 60)});
+    if (!auth.sign(*m_keys)) {
+        setStatus(QStringLiteral("could not sign upload"));
+        return;
+    }
+    QNetworkRequest request{QUrl(QStringLiteral("https://blossom.primal.net/upload"))};
+    request.setHeader(QNetworkRequest::ContentTypeHeader, QMimeDatabase().mimeTypeForFile(local).name());
+    request.setRawHeader("Authorization", "Nostr " + auth.toWire().toBase64());
+    QNetworkReply* reply = m_net.put(request, bytes);
+    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+        const QByteArray body = reply->isOpen() ? reply->readAll() : QByteArray();
+        const bool ok = reply->error() == QNetworkReply::NoError;
+        reply->deleteLater();
+        const QString url = QJsonDocument::fromJson(body).object().value(QStringLiteral("url")).toString();
+        if (!ok || url.isEmpty()) {
+            setStatus(QStringLiteral("image upload failed"));
+            return;
+        }
+        emit imageUploaded(url);
+        setStatus(QStringLiteral("image added"));
+    });
 }
 
 void AppController::publishProfile(const QString& name, const QString& about) {
@@ -402,6 +589,10 @@ void AppController::followNpub(const QString& text) {
     QString raw = text.trimmed();
     if (raw.startsWith(QStringLiteral("nostr:"), Qt::CaseInsensitive))
         raw = raw.mid(6);
+    if (raw.contains(QLatin1Char('@')) && !raw.contains(QLatin1Char(' '))) {
+        resolveNip05(raw, true);
+        return;
+    }
     QString pubkey;
     if (raw.startsWith(QStringLiteral("npub1"), Qt::CaseInsensitive)) {
         const auto decoded = bech32::decode(raw);
@@ -460,6 +651,10 @@ void AppController::openNote(const QString& eventId, const QString& pubkey, cons
     } else {
         m_openTags = m_noteTags.value(id);
     }
+    for (const QStringList& tag : m_openTags) {
+        if (tag.size() >= 2 && tag.at(0) == QStringLiteral("q"))
+            requestQuote(tag.at(1).toLower());
+    }
     m_replies.clear();
     emit noteChanged();
     noteAuthor(m_openPubkey);
@@ -470,6 +665,11 @@ void AppController::openNote(const QString& eventId, const QString& pubkey, cons
     QJsonObject self;
     self.insert(QStringLiteral("ids"), QJsonArray{id});
     m_pool.subscribe(QStringLiteral("thread"), QJsonArray{replies, self});
+    QJsonObject reactions;
+    reactions.insert(QStringLiteral("kinds"), QJsonArray{7});
+    reactions.insert(QStringLiteral("#e"), QJsonArray{eventId});
+    reactions.insert(QStringLiteral("limit"), 80);
+    m_pool.subscribe(QStringLiteral("reactions"), QJsonArray{reactions});
 }
 
 void AppController::closeNote() {
@@ -483,6 +683,7 @@ void AppController::closeNote() {
     m_openTags.clear();
     m_replies.clear();
     m_pool.unsubscribe(QStringLiteral("thread"));
+    m_pool.unsubscribe(QStringLiteral("reactions"));
     emit noteChanged();
 }
 
@@ -600,6 +801,10 @@ void AppController::openLink(const QString& link) {
     QString raw = link.trimmed();
     if (raw.startsWith(QStringLiteral("nostr:"), Qt::CaseInsensitive))
         raw = raw.mid(6);
+    if (raw.startsWith(QStringLiteral("tag:"))) {
+        openHashtag(raw.mid(4));
+        return;
+    }
     if (raw.startsWith(QStringLiteral("p:"))) {
         openProfile(raw.mid(2));
         return;
@@ -670,6 +875,7 @@ void AppController::persist() {
     settings.setValue(QStringLiteral("identity/about"), m_about);
     settings.setValue(QStringLiteral("relays"), m_pool.relays());
     settings.setValue(QStringLiteral("feedMode"), m_feedMode);
+    settings.setValue(QStringLiteral("muted"), QStringList(m_muted.cbegin(), m_muted.cend()));
     settings.setValue(QStringLiteral("follows"), QStringList(m_follows.cbegin(), m_follows.cend()));
     settings.setValue(QStringLiteral("contactsAt"), m_contactsAt);
 }
@@ -678,7 +884,12 @@ void AppController::load() {
     QSettings settings;
     m_displayName = settings.value(QStringLiteral("identity/name")).toString();
     m_about = settings.value(QStringLiteral("identity/about")).toString();
-    m_feedMode = settings.value(QStringLiteral("feedMode"), 0).toInt() == 1 ? 1 : 0;
+    const int savedMode = settings.value(QStringLiteral("feedMode"), 0).toInt();
+    m_feedMode = savedMode == 1 ? 1 : savedMode == 2 ? 2 : 0;
+    for (const QString& pubkey : settings.value(QStringLiteral("muted")).toStringList()) {
+        if (pubkey.size() == 64)
+            m_muted.insert(pubkey.toLower());
+    }
     const QStringList savedFollows = settings.value(QStringLiteral("follows")).toStringList();
     for (const QString& pubkey : savedFollows) {
         if (pubkey.size() == 64)
@@ -725,6 +936,16 @@ void AppController::subscribeAll() {
     contacts.insert(QStringLiteral("authors"), QJsonArray{m_keys->pubkeyHex()});
     contacts.insert(QStringLiteral("limit"), 1);
     m_pool.subscribe(QStringLiteral("contacts"), QJsonArray{contacts});
+    QJsonObject mutes;
+    mutes.insert(QStringLiteral("kinds"), QJsonArray{10000});
+    mutes.insert(QStringLiteral("authors"), QJsonArray{m_keys->pubkeyHex()});
+    mutes.insert(QStringLiteral("limit"), 1);
+    m_pool.subscribe(QStringLiteral("mutes"), QJsonArray{mutes});
+    QJsonObject mentions;
+    mentions.insert(QStringLiteral("kinds"), QJsonArray{1});
+    mentions.insert(QStringLiteral("#p"), QJsonArray{m_keys->pubkeyHex()});
+    mentions.insert(QStringLiteral("limit"), 40);
+    m_pool.subscribe(QStringLiteral("mentions"), QJsonArray{mentions});
     subscribeFeed();
     noteAuthor(m_keys->pubkeyHex());
 }
@@ -735,6 +956,16 @@ void AppController::subscribeFeed() {
     QJsonObject filter;
     filter.insert(QStringLiteral("kinds"), QJsonArray{1});
     filter.insert(QStringLiteral("limit"), m_feedMode == 1 && !m_follows.isEmpty() ? 50 : 30);
+    if (m_feedMode == 2) {
+        m_pool.unsubscribe(QStringLiteral("feed"));
+        m_pool.unsubscribe(QStringLiteral("following"));
+        QJsonObject mentions;
+        mentions.insert(QStringLiteral("kinds"), QJsonArray{1});
+        mentions.insert(QStringLiteral("#p"), QJsonArray{m_keys->pubkeyHex()});
+        mentions.insert(QStringLiteral("limit"), 40);
+        m_pool.subscribe(QStringLiteral("mentions"), QJsonArray{mentions});
+        return;
+    }
     if (m_feedMode == 1 && m_follows.isEmpty()) {
         m_pool.unsubscribe(QStringLiteral("feed"));
         m_pool.unsubscribe(QStringLiteral("following"));
@@ -857,6 +1088,50 @@ void AppController::handleEvent(const QString&, const QString& subId, const QJso
         rebuildOutbox();
         return;
     }
+    if (event->kind == 7) {
+        for (const QStringList& tag : event->tags) {
+            if (tag.size() < 2 || tag.at(0) != QStringLiteral("e") || tag.at(1).size() != 64)
+                continue;
+            const QString id = tag.at(1).toLower();
+            ++m_reactionCounts[id];
+            if (m_keys && event->pubkey == m_keys->pubkeyHex())
+                m_reacted.insert(id);
+        }
+        ++m_reactionEpoch;
+        emit reactionEpochChanged();
+        return;
+    }
+    if (event->kind == 6) {
+        NostrEvent shown = *event;
+        auto inner = NostrEvent::fromJson(QJsonDocument::fromJson(event->content.toUtf8()).object());
+        if (inner && !inner->content.isEmpty())
+            shown.content = inner->content;
+        else
+            shown.content = QStringLiteral("Reposted a note");
+        showNote(shown);
+        return;
+    }
+    if (event->kind == 10000) {
+        if (!m_keys || event->pubkey != m_keys->pubkeyHex())
+            return;
+        if (!newerReplaceable(event->createdAt, event->id, m_muteAt, m_muteId))
+            return;
+        m_muted.clear();
+        m_mutedWords.clear();
+        for (const QStringList& tag : event->tags) {
+            if (tag.size() < 2)
+                continue;
+            if (tag.at(0) == QStringLiteral("p") && tag.at(1).size() == 64)
+                m_muted.insert(tag.at(1).toLower());
+            else if (tag.at(0) == QStringLiteral("word"))
+                m_mutedWords.append(tag.at(1).toLower());
+        }
+        m_muteAt = event->createdAt;
+        m_muteId = event->id;
+        refillTimeline();
+        persist();
+        return;
+    }
     if (event->kind == 5) {
         for (const QStringList& tag : event->tags) {
             if (tag.size() < 2 || tag.at(0) != QStringLiteral("e") || tag.at(1).size() != 64)
@@ -887,6 +1162,15 @@ void AppController::handleEvent(const QString&, const QString& subId, const QJso
     }
     rememberNote(*event);
     m_noteTags.insert(event->id, event->tags);
+    if (m_quoteAsked.remove(event->id)) {
+        m_pool.unsubscribe(QStringLiteral("quote-") + event->id.left(12));
+        if (!m_mentionTimer.isActive())
+            m_mentionTimer.start();
+        for (const QStringList& tag : m_openTags) {
+            if (tag.size() >= 2 && tag.at(0) == QStringLiteral("q") && tag.at(1).toLower() == event->id)
+                emit noteChanged();
+        }
+    }
     indexPeople(*event);
     if (event->id == m_openId) {
         m_openContent = event->content;
@@ -905,13 +1189,7 @@ void AppController::handleEvent(const QString&, const QString& subId, const QJso
         m_replies.upsert(*event, name, picture);
     if (subId == QStringLiteral("thread"))
         return;
-    if (m_viewingProfile && event->pubkey == m_profilePubkey)
-        m_profileNotes.upsert(*event, name, picture);
-    if (subId == QStringLiteral("person"))
-        return;
-    if (m_feedMode == 1 && !m_follows.isEmpty() && m_keys && event->pubkey != m_keys->pubkeyHex() && !m_follows.contains(event->pubkey))
-        return;
-    m_timeline.upsert(*event, name, picture);
+    showNote(*event);
 }
 
 void AppController::handleProfile(const NostrEvent& event) {
@@ -930,6 +1208,10 @@ void AppController::handleProfile(const NostrEvent& event) {
     profile.name = name;
     profile.about = meta.value(QStringLiteral("about")).toString();
     profile.picture = safePicture(meta.value(QStringLiteral("picture")).toString());
+    profile.nip05 = meta.value(QStringLiteral("nip05")).toString().trimmed();
+    profile.nip05Ok = false;
+    if (!profile.nip05.isEmpty())
+        verifyNip05(event.pubkey, profile.nip05);
     if (!profile.picture.isEmpty())
         m_images.prefetch(profile.picture);
     profile.id = event.id;
@@ -1017,6 +1299,130 @@ void AppController::publishContacts() {
                    : QStringLiteral("follow list not sent — no relay connected"));
     persist();
     scheduleSave();
+}
+
+bool AppController::hidden(const NostrEvent& event) const {
+    if (m_muted.contains(event.pubkey))
+        return true;
+    const QString lower = event.content.toLower();
+    for (const QString& word : m_mutedWords) {
+        if (!word.isEmpty() && lower.contains(word))
+            return true;
+    }
+    for (const QStringList& tag : event.tags) {
+        if (tag.size() >= 2 && tag.at(0) == QStringLiteral("t") && m_mutedWords.contains(tag.at(1).toLower()))
+            return true;
+    }
+    return false;
+}
+
+void AppController::showNote(const NostrEvent& event) {
+    if (hidden(event))
+        return;
+    const QString name = nameFor(event.pubkey);
+    const QString picture = pictureFor(event.pubkey);
+    if (m_viewingProfile && event.pubkey == m_profilePubkey)
+        m_profileNotes.upsert(event, name, picture);
+    for (const QStringList& tag : event.tags) {
+        if (tag.size() >= 2 && tag.at(0) == QStringLiteral("q"))
+            requestQuote(tag.at(1).toLower());
+    }
+    if (m_viewingHashtag) {
+        for (const QStringList& tag : event.tags) {
+            if (tag.size() >= 2 && tag.at(0) == QStringLiteral("t") && tag.at(1).toLower() == m_hashtag)
+                m_hashtagNotes.upsert(event, name, picture);
+        }
+    }
+    bool mentionsMe = false;
+    if (m_keys) {
+        for (const QStringList& tag : event.tags) {
+            if (tag.size() >= 2 && tag.at(0) == QStringLiteral("p") && tag.at(1).toLower() == m_keys->pubkeyHex())
+                mentionsMe = true;
+        }
+    }
+    if (mentionsMe && (!m_keys || event.pubkey != m_keys->pubkeyHex()))
+        m_inbox.upsert(event, name, picture);
+    if (m_feedMode == 2)
+        return;
+    if (m_feedMode == 1 && !m_follows.isEmpty() && m_keys && event.pubkey != m_keys->pubkeyHex() && !m_follows.contains(event.pubkey))
+        return;
+    m_timeline.upsert(event, name, picture);
+}
+
+void AppController::publishMuteList() {
+    if (!m_keys)
+        return;
+    NostrEvent event;
+    event.kind = 10000;
+    event.createdAt = QDateTime::currentSecsSinceEpoch();
+    for (const QString& pubkey : m_muted)
+        event.tags.append({QStringLiteral("p"), pubkey});
+    for (const QString& word : m_mutedWords)
+        event.tags.append({QStringLiteral("word"), word});
+    publishEvent(event);
+}
+
+void AppController::verifyNip05(const QString& pubkey, const QString& nip05) {
+    const int at = nip05.indexOf(QLatin1Char('@'));
+    if (at <= 0 || at + 1 >= nip05.size())
+        return;
+    const QString name = nip05.left(at).toLower();
+    const QString domain = nip05.mid(at + 1).toLower();
+    QUrl url(QStringLiteral("https://") + domain + QStringLiteral("/.well-known/nostr.json"));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("name"), name);
+    url.setQuery(query);
+    QNetworkRequest request{url};
+    request.setTransferTimeout(8000);
+    QNetworkReply* reply = m_net.get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, pubkey, nip05, name] {
+        const QByteArray body = reply->isOpen() ? reply->readAll() : QByteArray();
+        const bool ok = reply->error() == QNetworkReply::NoError;
+        reply->deleteLater();
+        if (!m_profiles.contains(pubkey))
+            return;
+        const QString listed = QJsonDocument::fromJson(body).object().value(QStringLiteral("names")).toObject().value(name).toString().toLower();
+        m_profiles[pubkey].nip05Ok = ok && listed == pubkey;
+        m_profiles[pubkey].nip05 = nip05;
+        if (pubkey == m_profilePubkey)
+            emit profileChanged();
+    });
+}
+
+void AppController::resolveNip05(const QString& nip05, bool follow) {
+    const int at = nip05.indexOf(QLatin1Char('@'));
+    if (at <= 0)
+        return;
+    const QString name = nip05.left(at).toLower();
+    const QString domain = nip05.mid(at + 1).toLower();
+    QUrl url(QStringLiteral("https://") + domain + QStringLiteral("/.well-known/nostr.json"));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("name"), name);
+    url.setQuery(query);
+    QNetworkReply* reply = m_net.get(QNetworkRequest{url});
+    connect(reply, &QNetworkReply::finished, this, [this, reply, name, follow] {
+        const QByteArray body = reply->isOpen() ? reply->readAll() : QByteArray();
+        reply->deleteLater();
+        const QString pubkey = QJsonDocument::fromJson(body).object().value(QStringLiteral("names")).toObject().value(name).toString().toLower();
+        if (pubkey.size() != 64) {
+            setStatus(QStringLiteral("nip05 not found"));
+            return;
+        }
+        if (follow)
+            toggleFollow(pubkey);
+        else
+            openProfile(pubkey);
+    });
+}
+
+void AppController::requestQuote(const QString& eventId) {
+    if (eventId.size() != 64 || m_noteCache.contains(eventId) || m_quoteAsked.contains(eventId))
+        return;
+    m_quoteAsked.insert(eventId);
+    QJsonObject filter;
+    filter.insert(QStringLiteral("ids"), QJsonArray{eventId});
+    filter.insert(QStringLiteral("limit"), 1);
+    m_pool.subscribe(QStringLiteral("quote-") + eventId.left(12), QJsonArray{filter});
 }
 
 void AppController::forgetNote(const QString& eventId) {
@@ -1148,6 +1554,22 @@ QString AppController::renderNote(const QString& content, const QVector<QStringL
         hits.append({static_cast<int>(match.capturedStart()), static_cast<int>(match.capturedEnd()),
             QStringLiteral("<a href=\"%1\">%2</a>").arg(href, htmlEscape(label))});
     }
+    const QRegularExpression hashTag(QStringLiteral("#([A-Za-z0-9_]{1,64})"));
+    auto hashes = hashTag.globalMatch(content);
+    while (hashes.hasNext()) {
+        const auto match = hashes.next();
+        const QString tag = match.captured(1).toLower();
+        hits.append({static_cast<int>(match.capturedStart()), static_cast<int>(match.capturedEnd()),
+            QStringLiteral("<a href=\"tag:%1\">#%2</a>").arg(tag, htmlEscape(match.captured(1)))});
+    }
+    const QRegularExpression imageUrl(QStringLiteral("https://\\S+\\.(?:jpg|jpeg|png|gif|webp)"));
+    auto images = imageUrl.globalMatch(content);
+    while (images.hasNext()) {
+        const auto match = images.next();
+        const QString url = match.captured(0);
+        hits.append({static_cast<int>(match.capturedStart()), static_cast<int>(match.capturedEnd()),
+            QStringLiteral("<br><img src=\"%1\">").arg(htmlEscape(url))});
+    }
     std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.start < b.start; });
     QString out;
     int cursor = 0;
@@ -1159,6 +1581,29 @@ QString AppController::renderNote(const QString& content, const QVector<QStringL
         cursor = hit.end;
     }
     out += htmlEscape(content.mid(cursor));
+    for (const QStringList& tag : tags) {
+        if (tag.size() < 2 || tag.at(0) != QStringLiteral("q") || tag.at(1).size() != 64)
+            continue;
+        const QString id = tag.at(1).toLower();
+        const auto quoted = m_noteCache.constFind(id);
+        if (quoted == m_noteCache.cend()) {
+            out += QStringLiteral("<br><a href=\"e:%1\">quoted note</a>").arg(id);
+            continue;
+        }
+        QString who = nameFor(quoted->pubkey);
+        if (who.isEmpty())
+            who = quoted->pubkey.left(8);
+        QString text = quoted->content;
+        if (text.size() > 800)
+            text = text.left(800) + QStringLiteral("…");
+        out += QStringLiteral("<br><font color=\"#8a8a8a\">%1</font><br>%2")
+                   .arg(htmlEscape(who), htmlEscape(text));
+        const QRegularExpression quotedImage(QStringLiteral("https://\\S+\\.(?:jpg|jpeg|png|gif|webp)"));
+        auto quotedImages = quotedImage.globalMatch(quoted->content);
+        while (quotedImages.hasNext())
+            out += QStringLiteral("<br><img src=\"%1\">").arg(htmlEscape(quotedImages.next().captured(0)));
+        out += QStringLiteral("<br><a href=\"e:%1\">open quote</a>").arg(id);
+    }
     return out;
 }
 
@@ -1245,6 +1690,12 @@ void AppController::refillTimeline() {
     const bool filterFollows = m_feedMode == 1 && !m_follows.isEmpty();
     int shown = 0;
     for (const NostrEvent& event : notes) {
+        if (hidden(event))
+            continue;
+        for (const QStringList& tag : event.tags) {
+            if (tag.size() >= 2 && tag.at(0) == QStringLiteral("q"))
+                requestQuote(tag.at(1).toLower());
+        }
         if (filterFollows && event.pubkey != mine && !m_follows.contains(event.pubkey))
             continue;
         const QString picture = pictureFor(event.pubkey);

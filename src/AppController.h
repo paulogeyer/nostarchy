@@ -5,6 +5,8 @@
 #include "TimelineModel.h"
 #include "nostr/RelayPool.h"
 
+#include <QNetworkAccessManager>
+
 #include <QHash>
 #include <QObject>
 #include <QSet>
@@ -53,6 +55,15 @@ class AppController : public QObject {
     Q_PROPERTY(QString openNoteContent READ openNoteContent NOTIFY noteChanged)
     Q_PROPERTY(QString openNoteTime READ openNoteTime NOTIFY noteChanged)
     Q_PROPERTY(TimelineModel* replies READ replies CONSTANT)
+    Q_PROPERTY(TimelineModel* inbox READ inbox CONSTANT)
+    Q_PROPERTY(TimelineModel* hashtagNotes READ hashtagNotes CONSTANT)
+    Q_PROPERTY(bool viewingHashtag READ viewingHashtag NOTIFY hashtagChanged)
+    Q_PROPERTY(QString hashtag READ hashtag NOTIFY hashtagChanged)
+    Q_PROPERTY(bool quoting READ quoting NOTIFY quoteChanged)
+    Q_PROPERTY(QString quoteLabel READ quoteLabel NOTIFY quoteChanged)
+    Q_PROPERTY(QString profileNip05 READ profileNip05 NOTIFY profileChanged)
+    Q_PROPERTY(bool profileNip05Ok READ profileNip05Ok NOTIFY profileChanged)
+    Q_PROPERTY(int reactionEpoch READ reactionEpoch NOTIFY reactionEpochChanged)
     Q_PROPERTY(int avatarEpoch READ avatarEpoch NOTIFY avatarEpochChanged)
 
 public:
@@ -96,12 +107,33 @@ public:
     QString peopleTitle() const;
     PeopleModel* people();
     TimelineModel* replies();
+    TimelineModel* inbox();
+    TimelineModel* hashtagNotes();
+    bool viewingHashtag() const;
+    QString hashtag() const;
+    bool quoting() const;
+    QString quoteLabel() const;
+    QString profileNip05() const;
+    bool profileNip05Ok() const;
+    int reactionEpoch() const;
     TimelineModel* profileNotes();
 
     Q_INVOKABLE void generateIdentity();
     Q_INVOKABLE void importSecret(const QString& text);
     Q_INVOKABLE void publishNote(const QString& text);
     Q_INVOKABLE void deleteNote(const QString& eventId);
+    Q_INVOKABLE void react(const QString& eventId, const QString& pubkey);
+    Q_INVOKABLE void repost(const QString& eventId, const QString& pubkey);
+    Q_INVOKABLE void beginQuote(const QString& eventId, const QString& pubkey, const QString& name);
+    Q_INVOKABLE void cancelQuote();
+    Q_INVOKABLE void copyNote(const QString& eventId);
+    Q_INVOKABLE void mutePubkey(const QString& pubkey);
+    Q_INVOKABLE void unmutePubkey(const QString& pubkey);
+    Q_INVOKABLE bool isMuted(const QString& pubkey) const;
+    Q_INVOKABLE int reactionCount(const QString& eventId) const;
+    Q_INVOKABLE void openHashtag(const QString& tag);
+    Q_INVOKABLE void closeHashtag();
+    Q_INVOKABLE void uploadImage(const QString& path);
     Q_INVOKABLE void publishProfile(const QString& name, const QString& about);
     Q_INVOKABLE void beginReply(const QString& eventId, const QString& pubkey, const QString& name);
     Q_INVOKABLE void cancelReply();
@@ -132,6 +164,10 @@ signals:
     void profileChanged();
     void peopleChanged();
     void avatarEpochChanged();
+    void hashtagChanged();
+    void quoteChanged();
+    void reactionEpochChanged();
+    void imageUploaded(const QString& url);
 
 private:
     struct Profile {
@@ -139,6 +175,8 @@ private:
         QString name;
         QString about;
         QString picture;
+        QString nip05;
+        bool nip05Ok = false;
         qint64 createdAt = 0;
     };
     struct Social {
@@ -182,6 +220,12 @@ private:
     void applySocial(const QString& pubkey);
     void publishContacts();
     void forgetNote(const QString& eventId);
+    void publishMuteList();
+    void verifyNip05(const QString& pubkey, const QString& nip05);
+    void resolveNip05(const QString& nip05, bool follow);
+    bool hidden(const NostrEvent& event) const;
+    void showNote(const NostrEvent& event);
+    void requestQuote(const QString& eventId);
     bool publishEvent(NostrEvent event);
     QString nameFor(const QString& pubkey) const;
     void setStatus(const QString& text);
@@ -191,6 +235,8 @@ private:
     ImageCache m_images;
     TimelineModel m_timeline;
     TimelineModel m_replies{nullptr, false};
+    TimelineModel m_inbox;
+    TimelineModel m_hashtagNotes;
     TimelineModel m_profileNotes;
     PeopleModel m_people;
     QTimer m_profileTimer;
@@ -237,4 +283,16 @@ private:
     bool m_viewingPeople = false;
     int m_peopleMode = 0;
     int m_avatarEpoch = 0;
+    qint64 m_muteAt = -1;
+    QString m_muteId;
+    int m_reactionEpoch = 0;
+    QHash<QString, int> m_reactionCounts;
+    QSet<QString> m_reacted;
+    QSet<QString> m_quoteAsked;
+    QSet<QString> m_muted;
+    QStringList m_mutedWords;
+    bool m_viewingHashtag = false;
+    QString m_hashtag;
+    std::optional<Reply> m_quote;
+    QNetworkAccessManager m_net;
 };

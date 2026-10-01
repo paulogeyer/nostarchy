@@ -108,6 +108,16 @@ void TimelineModel::remove(const QString& eventId) {
     endRemoveRows();
 }
 
+void TimelineModel::removeAuthor(const QString& pubkey) {
+    for (int row = m_notes.size() - 1; row >= 0; --row) {
+        if (m_notes.at(row).pubkey != pubkey)
+            continue;
+        beginRemoveRows(QModelIndex(), row, row);
+        m_notes.removeAt(row);
+        endRemoveRows();
+    }
+}
+
 void TimelineModel::setAuthor(const QString& pubkey, const QString& name, const QString& picture) {
     for (int i = 0; i < m_notes.size(); ++i) {
         if (m_notes.at(i).pubkey != pubkey)

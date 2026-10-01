@@ -1,6 +1,6 @@
 # Nostarchy
 
-A small desktop Nostr client. C++20, Qt 6, and QML. It speaks NIP-01 over its own WebSocket client and signs with secp256k1.
+Version 0.3. A small desktop Nostr client. C++20, Qt 6, and QML. It speaks NIP-01 over its own WebSocket client and signs with secp256k1.
 
 ## Build
 

@@ -236,7 +236,7 @@ void RelayPool::addMetadataRelay(const QString& raw) {
 
 bool RelayPool::isMetadataSub(const QString& id) {
     return id == QStringLiteral("profiles") || id == QStringLiteral("person") || id == QStringLiteral("thread")
-        || id == QStringLiteral("relaylists") || id == QStringLiteral("graph");
+        || id == QStringLiteral("relaylists") || id == QStringLiteral("graph") || id == QStringLiteral("mutes");
 }
 
 void RelayPool::retarget(Session* session, const QString& raw) {

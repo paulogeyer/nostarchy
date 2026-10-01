@@ -5,6 +5,7 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QtLogging>
 
 namespace {
 
@@ -39,9 +40,12 @@ qreal Theme::hyprOption(const QString& name, qreal fallback) {
 
 Theme::Theme(QObject* parent)
     : QObject(parent) {
-    const qreal touchpad = hyprOption(QStringLiteral("input:touchpad:scroll_factor"), 1.0);
+    const qreal touchpad = hyprOption(QStringLiteral("input:touchpad:scroll_factor"), 0.4);
     const qreal mouse = hyprOption(QStringLiteral("input:scroll_factor"), 1.0);
-    m_wheelBoost = qBound(4.0, qMax(mouse, 1.5) / touchpad, 8.0);
+    // Hyprland already multiplies touchpad events by scroll_factor (0.4 here).
+    // Qt's own notch is only ~15px, so scale a detent back up by 1/factor.
+    m_wheelBoost = qBound(1.0, qMax(mouse, 1.0) / qMax(touchpad, 0.05), 12.0);
+    qInfo().noquote() << "scroll factors mouse" << mouse << "touchpad" << touchpad << "boost" << m_wheelBoost;
     reload();
     const QString dir = themeDir();
     m_watch.addPath(dir);

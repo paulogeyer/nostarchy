@@ -30,6 +30,7 @@ public:
 
     void upsert(const NostrEvent& event, const QString& name, const QString& picture = {});
     void remove(const QString& eventId);
+    void removeAuthor(const QString& pubkey);
     void setAuthor(const QString& pubkey, const QString& name, const QString& picture);
     void setFollows(const QSet<QString>& follows);
     void clear();

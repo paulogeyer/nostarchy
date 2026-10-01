@@ -116,7 +116,7 @@ void WebSocketClient::startHandshake() {
     request += "Connection: Upgrade\r\n";
     request += "Sec-WebSocket-Key: " + m_acceptKey + "\r\n";
     request += "Sec-WebSocket-Version: 13\r\n";
-    request += "User-Agent: nostarchy/0.1\r\n";
+    request += "User-Agent: nostarchy/0.3\r\n";
     request += "\r\n";
     m_socket->write(request);
 }

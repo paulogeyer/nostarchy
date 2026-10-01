@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 
 ApplicationWindow {
@@ -26,15 +27,20 @@ ApplicationWindow {
     background: Rectangle { color: theme.background }
 
     component FastWheel: WheelHandler {
+        property Flickable flick: parent
         blocking: true
+        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
         onWheel: (event) => {
-            const flick = parent
-            const boost = theme.wheelBoost
-            let dy = event.pixelDelta.y
+            if (!flick)
+                return
+            const boost = theme.wheelBoost > 0 ? theme.wheelBoost : 2.5
+            const angle = event.angleDelta.y
+            const pixel = event.pixelDelta.y
+            const detent = angle / 120 * 280 * boost
+            const scaled = pixel * boost * 3
+            let dy = Math.abs(detent) >= Math.abs(scaled) ? detent : scaled
             if (Math.abs(dy) < 1)
-                dy = event.angleDelta.y * boost * 0.55
-            else
-                dy *= boost
+                dy = angle * boost
             flick.contentY -= dy
             flick.returnToBounds()
             event.accepted = true
@@ -130,16 +136,40 @@ ApplicationWindow {
         }
     }
 
-component RichNote: Text {
-    property string body
-    width: parent.width
-    text: body
-    textFormat: Text.StyledText
-        color: theme.bright
-        font.pixelSize: 14
-        wrapMode: Text.Wrap
-        linkColor: theme.accent
-        onLinkActivated: (link) => app.openLink(link)
+    component RichNote: Column {
+        id: richNote
+        property string body
+        property int textSize: 14
+        width: parent.width
+        spacing: 8
+        Text {
+            width: parent.width
+            text: body.replace(/<br><img src="[^"]*">/g, "")
+            textFormat: Text.StyledText
+            color: theme.bright
+            font.pixelSize: richNote.textSize
+            wrapMode: Text.Wrap
+            linkColor: theme.accent
+            onLinkActivated: (link) => app.openLink(link)
+        }
+        Repeater {
+            model: {
+                const found = []
+                const re = /<img src="([^"]+)">/g
+                let match
+                while ((match = re.exec(body)) !== null)
+                    found.push(match[1])
+                return found
+            }
+            Image {
+                width: richNote.width
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                source: modelData
+                sourceSize.width: richNote.width
+                height: status === Image.Ready ? implicitHeight : 0
+            }
+        }
     }
 
     Item {
@@ -238,13 +268,25 @@ component RichNote: Text {
                     onClicked: {
                         app.closeProfile()
                         app.closeNote()
+                        app.closeHashtag()
                         app.feedMode = 1
+                    }
+                }
+                QuietButton {
+                    text: "Replies"
+                    checked: app.feedMode === 2
+                    Layout.fillWidth: true
+                    onClicked: {
+                        app.closeProfile()
+                        app.closeNote()
+                        app.closeHashtag()
+                        app.feedMode = 2
                     }
                 }
                 Field {
                     id: followField
                     Layout.fillWidth: true
-                    placeholderText: "npub1…"
+                    placeholderText: "npub or name@domain"
                     font.pixelSize: 11
                     onAccepted: app.followNpub(text)
                 }
@@ -414,18 +456,21 @@ component RichNote: Text {
                     spacing: 8
 
                     Row {
-                        visible: app.replying
+                        visible: app.replying || app.quoting
                         spacing: 8
                         width: parent.width
                         Text {
-                            text: "Replying to " + app.replyLabel
+                            text: app.quoting ? "Quoting " + app.quoteLabel : "Replying to " + app.replyLabel
                             color: theme.accent
                             font.pixelSize: 12
                             anchors.verticalCenter: parent.verticalCenter
                         }
                         QuietButton {
                             text: "Cancel"
-                            onClicked: app.cancelReply()
+                            onClicked: {
+                                app.cancelReply()
+                                app.cancelQuote()
+                            }
                         }
                     }
 
@@ -457,6 +502,10 @@ component RichNote: Text {
                             enabled: composer.text.trim().length > 0
                             onClicked: post()
                         }
+                        QuietButton {
+                            text: "Image"
+                            onClicked: imageDialog.open()
+                        }
                         Text {
                             text: app.statusText
                             color: theme.muted
@@ -486,7 +535,7 @@ component RichNote: Text {
                     contentHeight: profileColumn.implicitHeight
                     clip: true
                     boundsBehavior: Flickable.StopAtBounds
-                    FastWheel {}
+                    FastWheel { flick: profilePage }
                     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                     property string shownPubkey: app.profilePubkey
                     onShownPubkeyChanged: contentY = 0
@@ -522,10 +571,21 @@ component RichNote: Text {
                             body: app.profileAbout
                             visible: app.profileAbout.length > 0
                         }
+                        Text {
+                            visible: app.profileNip05.length > 0
+                            text: (app.profileNip05Ok ? "✓ " : "") + app.profileNip05
+                            color: app.profileNip05Ok ? theme.accent : theme.muted
+                            font.pixelSize: 12
+                        }
                         QuietButton {
                             visible: app.profilePubkey !== app.pubkey
                             text: app.followCount >= 0 && app.isFollowed(app.profilePubkey) ? "Following" : "Follow"
                             onClicked: app.toggleFollow(app.profilePubkey)
+                        }
+                        QuietButton {
+                            visible: app.profilePubkey !== app.pubkey
+                            text: app.isMuted(app.profilePubkey) ? "Unmute" : "Mute"
+                            onClicked: app.isMuted(app.profilePubkey) ? app.unmutePubkey(app.profilePubkey) : app.mutePubkey(app.profilePubkey)
                         }
                         Row {
                             spacing: 16
@@ -661,10 +721,12 @@ component RichNote: Text {
                                         Text { text: timeText; color: theme.faint; font.pixelSize: 11 }
                                     }
                                     RichNote { body: richContent }
-                                    QuietButton {
-                                        text: "View"
-                                        onClicked: app.openNote(eventId, pubkey, name, content, timeText)
-                                    }
+                                QuietButton {
+                                    text: "View"
+                                    onClicked: app.openNote(eventId, pubkey, name, content, timeText)
+                                }
+                                QuietButton { text: "Like"; onClicked: app.react(eventId, pubkey) }
+                                QuietButton { text: "Repost"; onClicked: app.repost(eventId, pubkey) }
                                 }
                             }
                         }
@@ -679,7 +741,7 @@ component RichNote: Text {
                     clip: true
                     contentHeight: noteColumn.implicitHeight
                     boundsBehavior: Flickable.StopAtBounds
-                    FastWheel {}
+                    FastWheel { flick: notePage }
                     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
                     Column {
@@ -717,13 +779,37 @@ component RichNote: Text {
                         id: openNoteText
                         width: parent.width
                         body: app.openNoteRich
-                        font.pixelSize: 15
+                        textSize: 15
                     }
                     Row {
                         spacing: 6
                         QuietButton {
                             text: "Reply"
                             onClicked: app.beginReply(app.openNoteId, app.openNotePubkey, app.openNoteName)
+                        }
+                        QuietButton {
+                            text: app.reactionCount(app.openNoteId) > 0 ? "Like " + app.reactionCount(app.openNoteId) : "Like"
+                            onClicked: app.react(app.openNoteId, app.openNotePubkey)
+                        }
+                        QuietButton {
+                            text: "Repost"
+                            onClicked: app.repost(app.openNoteId, app.openNotePubkey)
+                        }
+                        QuietButton {
+                            text: "Quote"
+                            onClicked: {
+                                app.beginQuote(app.openNoteId, app.openNotePubkey, app.openNoteName)
+                                app.closeNote()
+                            }
+                        }
+                        QuietButton {
+                            text: "Copy id"
+                            onClicked: app.copyNote(app.openNoteId)
+                        }
+                        QuietButton {
+                            visible: app.openNotePubkey !== app.pubkey
+                            text: app.isMuted(app.openNotePubkey) ? "Unmute" : "Mute"
+                            onClicked: app.isMuted(app.openNotePubkey) ? app.unmutePubkey(app.openNotePubkey) : app.mutePubkey(app.openNotePubkey)
                         }
                         QuietButton {
                             visible: app.openNotePubkey === app.pubkey
@@ -807,15 +893,68 @@ component RichNote: Text {
                     }
                 }
 
+                Column {
+                    visible: app.viewingHashtag && !app.viewing && !app.viewingProfile
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    spacing: 8
+                    Row {
+                        spacing: 8
+                        QuietButton { text: "Back"; onClicked: app.closeHashtag() }
+                        Text {
+                            text: "#" + app.hashtag
+                            color: theme.text
+                            font.pixelSize: 16
+                            font.bold: true
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                    }
+                    ListView {
+                        id: tagView
+                        width: parent.width
+                        height: parent.height - 40
+                        FastWheel { flick: tagView }
+                        spacing: 8
+                        clip: true
+                        model: app.hashtagNotes
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                        delegate: Rectangle {
+                            required property string eventId
+                            required property string pubkey
+                            required property string name
+                            required property string richContent
+                            required property string timeText
+                            required property string content
+                            width: tagView.width
+                            implicitHeight: tagCol.implicitHeight + 20
+                            height: implicitHeight
+                            radius: 10
+                            color: theme.card
+                            Column {
+                                id: tagCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 12
+                                spacing: 6
+                                Text { text: name + " · " + timeText; color: theme.accent; font.pixelSize: 13 }
+                                RichNote { body: richContent }
+                                QuietButton { text: "View"; onClicked: app.openNote(eventId, pubkey, name, content, timeText) }
+                            }
+                        }
+                    }
+                }
+
                 ListView {
                     id: feedView
-                    FastWheel {}
-                    visible: !app.viewing && !app.viewingProfile
+                    FastWheel { flick: feedView }
+                    visible: !app.viewing && !app.viewingProfile && !app.viewingHashtag
                     anchors.fill: parent
                     anchors.margins: 8
                     spacing: 8
                     clip: true
-                    model: app.timeline
+                    model: app.feedMode === 2 ? app.inbox : app.timeline
                     boundsBehavior: Flickable.StopAtBounds
                     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
@@ -877,6 +1016,18 @@ component RichNote: Text {
                                     onClicked: app.beginReply(eventId, pubkey, name)
                                 }
                                 QuietButton {
+                                    text: app.reactionEpoch >= 0 && app.reactionCount(eventId) > 0 ? "Like " + app.reactionCount(eventId) : "Like"
+                                    onClicked: app.react(eventId, pubkey)
+                                }
+                                QuietButton {
+                                    text: "Repost"
+                                    onClicked: app.repost(eventId, pubkey)
+                                }
+                                QuietButton {
+                                    text: "Quote"
+                                    onClicked: app.beginQuote(eventId, pubkey, name)
+                                }
+                                QuietButton {
                                     visible: pubkey !== app.pubkey
                                     text: followed ? "Following" : "Follow"
                                     checked: followed
@@ -891,16 +1042,30 @@ component RichNote: Text {
                     anchors.centerIn: parent
                     width: parent.width - 48
                     horizontalAlignment: Text.AlignHCenter
-                    visible: !app.viewing && !app.viewingProfile && feedView.count === 0
+                    visible: !app.viewing && !app.viewingProfile && !app.viewingHashtag && feedView.count === 0
                     color: theme.faint
                     font.pixelSize: 14
                     wrapMode: Text.Wrap
                     text: app.feedMode === 1
                           ? "No notes from people you follow yet."
-                          : "Waiting for notes from relays."
+                          : app.feedMode === 2
+                            ? "No replies yet."
+                            : "Waiting for notes from relays."
                 }
             }
         }
+    }
+
+    FileDialog {
+        id: imageDialog
+        title: "Add an image"
+        nameFilters: ["Images (*.png *.jpg *.jpeg *.gif *.webp)"]
+        onAccepted: app.uploadImage(selectedFile)
+    }
+
+    Connections {
+        target: app
+        function onImageUploaded(url) { composer.text = (composer.text + " " + url).trim() }
     }
 
     function post() {
